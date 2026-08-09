@@ -1,0 +1,66 @@
+# ==========================================
+# 飞书 AI 新闻推送 Bot — Docker Compose
+# ==========================================
+
+services:
+  # ========== FastAPI 应用 ==========
+  app:
+    build: .
+    container_name: feishu-news-bot
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Docker 内部网络使用 service 名，覆盖 .env 中的 127.0.0.1
+      - MYSQL_HOST=mysql
+      - REDIS_HOST=redis
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  # ========== MySQL 8.0 ==========
+  mysql:
+    image: mysql:8.0
+    container_name: feishu-news-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-yourpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-lark_news}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ========== Redis 7 ==========
+  redis:
+    image: redis:7-alpine
+    container_name: feishu-news-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:

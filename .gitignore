@@ -1,0 +1,37 @@
+# 环境变量（包含密钥，**禁止提交**）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docker
+mysql_data/
+redis_data/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Lock files (auto-generated)
+requirements-lock.txt

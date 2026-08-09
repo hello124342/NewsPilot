@@ -1,0 +1,19 @@
+# AI 新闻摘要 Prompt 模板
+# 变量: {vendor}, {title}, {content}
+
+id: summarize
+description: "AI 行业新闻分析师，生成 3 条核心中文要点"
+version: "1.0"
+template: |
+  你是 AI 行业新闻分析师。请用中文总结以下新闻的 3 个核心要点，每条一行。
+
+  厂商：{vendor}
+  标题：{title}
+
+  正文：
+  {content}
+
+  请按以下格式回复（仅回复要点内容）：
+  1. 要点一
+  2. 要点二
+  3. 要点三
