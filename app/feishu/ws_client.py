@@ -53,11 +53,13 @@ def run_ws_client(
                 log_level=lark.LogLevel.INFO,
             )
             logger.info("WebSocket client connecting to Feishu...")
+            _emit_ws_metric(connected=True)
             ws_client.start()  # blocking
         except Exception as e:
             logger.warning(
                 f"WebSocket disconnected: {e}, retrying in {retry_delay}s"
             )
+            _emit_ws_metric(connected=False)
 
         time.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, max_delay)
@@ -87,3 +89,16 @@ def start_ws_thread(
     thread.start()
     logger.info(f"WebSocket thread started (daemon): {thread.name}")
     return thread
+
+
+def _emit_ws_metric(connected: bool) -> None:
+    """将 WebSocket 连接状态推送到 Prometheus（延迟导入避免循环依赖）"""
+    try:
+        from app.core.metrics import ws_connection_status, ws_disconnect_total
+        if connected:
+            ws_connection_status.set(1)
+        else:
+            ws_connection_status.set(0)
+            ws_disconnect_total.inc()
+    except ImportError:
+        pass

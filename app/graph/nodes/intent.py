@@ -78,8 +78,30 @@ def extract_vendor_from_query(query: str) -> str | None:
 )
 def _call_llm_intent(llm, prompt: str) -> str:
     """调用 LLM 解析意图（带重试）"""
-    response = llm.invoke(prompt)
-    return response.content  # type: ignore[union-attr]
+    import time as _time
+    start = _time.perf_counter()
+    try:
+        response = llm.invoke(prompt)
+        elapsed = _time.perf_counter() - start
+        _emit_llm_metric("intent", elapsed, success=True)
+        return response.content  # type: ignore[union-attr]
+    except Exception:
+        elapsed = _time.perf_counter() - start
+        _emit_llm_metric("intent", elapsed, success=False)
+        raise
+
+
+def _emit_llm_metric(operation: str, elapsed: float, success: bool) -> None:
+    """发送 LLM 调用指标到 Prometheus（延迟导入避免循环依赖）"""
+    try:
+        from app.core.metrics import llm_call_duration_seconds, llm_call_errors_total
+        llm_call_duration_seconds.labels(provider="auto", operation=operation).observe(elapsed)
+        if not success:
+            llm_call_errors_total.labels(
+                provider="auto", operation=operation, error_type="LLMCallFailed"
+            ).inc()
+    except ImportError:
+        pass
 
 
 def intent_node(state: QueryState) -> QueryState:

@@ -11,18 +11,23 @@
 - **订阅管理** — 厂商粒度的订阅/退订，群主权限控制
 - **推送定制** — 3 时段 (09/12/18) × 3 频率 (每天/工作日/每周)
 - **自动群发现** — WebSocket 长连接，拉群即注册，无需配置 chat_id
+- **生产级可观测性** — 结构化 JSON 日志 + Prometheus 指标 + Grafana 仪表板（36 项监控指标）
 
 ## Architecture
 
 ```
 FastAPI (HTTP)                WS Daemon Thread            APScheduler
-/health /admin/*              lark.ws.Client              05:00 process_rss
-  │                             │ (receive events)          09:00 deliver
+/health /metrics              lark.ws.Client              05:00 process_rss
+/admin/*                       │ (receive events)          09:00 deliver
   │                             │                           12:00 deliver
   │                    ThreadPoolExecutor                   18:00 deliver
   │                     (max_workers=5)                        │
   │                        │                                  │
   └────────────────────────┼──────────────────────────────────┘
+                           │
+      Prometheus ◄─────────┤ (scrape /metrics every 15s)
+          │                │
+      Grafana ◄────────────┘ (dashboard at :3000)
                            │
               ┌────────────┼────────────┐
               ▼            ▼            ▼
@@ -164,10 +169,22 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 **Vendors:** OpenAI / Anthropic / Google DeepMind / DeepSeek / Kimi (Moonshot) / Z.ai
 
+## Monitoring
+
+`docker-compose up -d --build` 自带监控栈：
+
+| 服务 | 地址 | 说明 |
+|------|------|------|
+| **Grafana** | `http://localhost:3000` (admin/admin) | 预制仪表板，8 行面板，实时刷新 |
+| **Prometheus** | `http://localhost:9090` | 指标查询，15s 采集间隔 |
+| **App Metrics** | `http://localhost:8000/metrics` | 原始 Prometheus 指标 |
+
+仪表板覆盖：HTTP 流量、RSS 管道、推送投递、LLM 调用、WebSocket、飞书 API、内容抓取、熔断器。
+
 ## Testing
 
 ```bash
-pytest -v          # 165 tests across 12 test files
+pytest -v          # ~190 tests across 15 test files
 ```
 
 ## License

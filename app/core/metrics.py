@@ -1,0 +1,333 @@
+"""Prometheus 指标定义模块（项目内所有指标的唯一来源）
+
+通过 prometheus_client 定义 Counter / Gauge / Histogram。
+指标命名遵循 OpenMetrics 规范：namespace_subsystem_name_unit
+
+设计原则：
+- 所有指标集中定义在此模块，禁止在其他模块直接 import prometheus_client
+- 指标注册使用全局单例 CollectorRegistry，避免污染全局默认 registry
+- 提供 decorator 和 context manager 用于便捷埋点，不污染业务代码
+"""
+import time
+import functools
+from contextlib import contextmanager
+from typing import Callable, TypeVar
+
+from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+
+T = TypeVar("T")
+
+# 独立 registry，不污染全局默认 registry
+_registry = CollectorRegistry()
+
+# ========== Circuit Breaker ==========
+
+cb_state = Gauge(
+    "feishu_bot_circuit_breaker_state",
+    "Circuit breaker state: 0=CLOSED, 1=OPEN, 2=HALF_OPEN",
+    ["cb_name"],
+    registry=_registry,
+)
+
+# ========== RSS / Fetch Job ==========
+
+rss_job_duration_seconds = Histogram(
+    "feishu_bot_rss_job_duration_seconds",
+    "RSS job total duration in seconds",
+    registry=_registry,
+)
+
+rss_articles_fetched_total = Counter(
+    "feishu_bot_rss_articles_fetched_total",
+    "Total articles fetched from upstream sources",
+    ["source"],
+    registry=_registry,
+)
+
+rss_articles_processed_total = Counter(
+    "feishu_bot_rss_articles_processed_total",
+    "Total articles successfully processed through pipeline",
+    registry=_registry,
+)
+
+rss_articles_skipped_total = Counter(
+    "feishu_bot_rss_articles_skipped_total",
+    "Total articles skipped (already processed or keyword filter)",
+    registry=_registry,
+)
+
+rss_graph_errors_total = Counter(
+    "feishu_bot_rss_graph_errors_total",
+    "Total unhandled exceptions from LangGraph runtime",
+    ["source"],
+    registry=_registry,
+)
+
+# ========== Deliver Job ==========
+
+deliver_job_duration_seconds = Histogram(
+    "feishu_bot_deliver_job_duration_seconds",
+    "Deliver job total duration in seconds",
+    ["push_time"],
+    registry=_registry,
+)
+
+deliver_cards_sent_total = Counter(
+    "feishu_bot_deliver_cards_sent_total",
+    "Total cards sent during deliver job",
+    ["push_time"],
+    registry=_registry,
+)
+
+deliver_errors_total = Counter(
+    "feishu_bot_deliver_errors_total",
+    "Total errors during deliver job",
+    ["push_time"],
+    registry=_registry,
+)
+
+# ========== LLM Calls ==========
+
+llm_call_duration_seconds = Histogram(
+    "feishu_bot_llm_call_duration_seconds",
+    "LLM API call latency in seconds",
+    ["provider", "operation"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+    registry=_registry,
+)
+
+llm_call_errors_total = Counter(
+    "feishu_bot_llm_call_errors_total",
+    "Total LLM call errors",
+    ["provider", "operation", "error_type"],
+    registry=_registry,
+)
+
+# ========== WebSocket ==========
+
+ws_connection_status = Gauge(
+    "feishu_bot_ws_connection_status",
+    "WebSocket connection status: 1=connected, 0=disconnected",
+    registry=_registry,
+)
+
+ws_disconnect_total = Counter(
+    "feishu_bot_ws_disconnect_total",
+    "Total WebSocket disconnections",
+    registry=_registry,
+)
+
+# ========== Feishu API ==========
+
+feishu_api_duration_seconds = Histogram(
+    "feishu_bot_feishu_api_duration_seconds",
+    "Feishu API call latency in seconds",
+    ["method"],
+    registry=_registry,
+)
+
+feishu_api_errors_total = Counter(
+    "feishu_bot_feishu_api_errors_total",
+    "Feishu API call errors",
+    ["method", "code"],
+    registry=_registry,
+)
+
+# ========== Content Scraping ==========
+
+scrape_success_total = Counter(
+    "feishu_bot_scrape_success_total",
+    "Total successful content scrapes",
+    ["fetcher_type"],
+    registry=_registry,
+)
+
+scrape_failure_total = Counter(
+    "feishu_bot_scrape_failure_total",
+    "Total failed content scrapes",
+    ["fetcher_type"],
+    registry=_registry,
+)
+
+# ========== HTTP Middleware ==========
+
+http_requests_total = Counter(
+    "feishu_bot_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+    registry=_registry,
+)
+
+http_request_duration_seconds = Histogram(
+    "feishu_bot_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+    registry=_registry,
+)
+
+# ========== Decorators 和 Context Managers ==========
+
+
+@contextmanager
+def track_duration(histogram: Histogram, **labels):
+    """记录代码块执行耗时。
+
+    用法:
+        with track_duration(llm_call_duration_seconds, provider="openai", operation="summarize"):
+            result = do_work()
+    """
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if labels:
+            histogram.labels(**labels).observe(elapsed)
+        else:
+            histogram.observe(elapsed)
+
+
+def track_llm_call(provider: str, operation: str):
+    """LLM 调用埋点 decorator，自动记录耗时和错误次数。
+
+    用法:
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential())
+        @track_llm_call(provider="deepseek", operation="summarize")
+        def _call_llm_summarize(llm, prompt: str) -> str:
+            ...
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                llm_call_duration_seconds.labels(
+                    provider=provider, operation=operation
+                ).observe(elapsed)
+                return result
+            except Exception as e:
+                elapsed = time.perf_counter() - start
+                llm_call_duration_seconds.labels(
+                    provider=provider, operation=operation
+                ).observe(elapsed)
+                llm_call_errors_total.labels(
+                    provider=provider,
+                    operation=operation,
+                    error_type=type(e).__name__,
+                ).inc()
+                raise
+        return wrapper
+    return decorator
+
+
+def track_feishu_api(method: str):
+    """飞书 API 调用埋点 decorator，记录耗时和按错误码分类的错误。
+
+    用法:
+        @track_feishu_api("send_card")
+        def _send_card_impl(self, request):
+            ...
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                feishu_api_duration_seconds.labels(method=method).observe(elapsed)
+                return result
+            except Exception as e:
+                elapsed = time.perf_counter() - start
+                feishu_api_duration_seconds.labels(method=method).observe(elapsed)
+                feishu_api_errors_total.labels(
+                    method=method, code=type(e).__name__
+                ).inc()
+                raise
+        return wrapper
+    return decorator
+
+
+def track_job_metrics(job_type: str):
+    """定时任务埋点 decorator，记录总耗时和成功/失败。
+
+    job_type: "rss" | "deliver"
+
+    被装饰函数的返回值应包含 {"status": "ok", "processed": N} 或 {"status": "ok", "delivered": N}。
+    """
+    def decorator(func: Callable[..., dict]) -> Callable[..., dict]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> dict:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                if job_type == "rss":
+                    rss_job_duration_seconds.observe(elapsed)
+                elif job_type == "deliver":
+                    push_time = kwargs.get("push_time", args[0] if args else "09:00")
+                    deliver_job_duration_seconds.labels(push_time=push_time).observe(elapsed)
+                return result
+            except Exception:
+                elapsed = time.perf_counter() - start
+                if job_type == "rss":
+                    rss_job_duration_seconds.observe(elapsed)
+                elif job_type == "deliver":
+                    push_time = kwargs.get("push_time", args[0] if args else "09:00")
+                    deliver_job_duration_seconds.labels(push_time=push_time).observe(elapsed)
+                raise
+        return wrapper
+    return decorator
+
+
+# ========== Registry 访问 ==========
+
+
+def init_metrics() -> None:
+    """初始化所有指标为零值，确保 Prometheus 抓取时所有指标都存在。
+
+    在应用启动时调用一次。Prometheus 只在指标首次有数据时才注册，
+    未初始化的指标在 Grafana 中会显示 "No data"。
+    """
+    # Circuit Breaker
+    cb_state.labels(cb_name="feishu-api").set(0)
+
+    # RSS Job
+    rss_articles_processed_total.inc(0)
+    rss_articles_skipped_total.inc(0)
+
+    # Deliver Job
+    deliver_cards_sent_total.labels(push_time="09:00").inc(0)
+    deliver_cards_sent_total.labels(push_time="12:00").inc(0)
+    deliver_cards_sent_total.labels(push_time="18:00").inc(0)
+    deliver_errors_total.labels(push_time="09:00").inc(0)
+    deliver_errors_total.labels(push_time="12:00").inc(0)
+    deliver_errors_total.labels(push_time="18:00").inc(0)
+
+    # WebSocket
+    ws_connection_status.set(0)
+    ws_disconnect_total.inc(0)
+
+    # Feishu API
+    feishu_api_duration_seconds.labels(method="send_card").observe(0)
+    feishu_api_duration_seconds.labels(method="get_chat_info").observe(0)
+
+    # Scraping
+    scrape_success_total.labels(fetcher_type="trafilatura").inc(0)
+    scrape_failure_total.labels(fetcher_type="trafilatura").inc(0)
+
+    # LLM
+    llm_call_duration_seconds.labels(provider="auto", operation="summarize").observe(0)
+    llm_call_duration_seconds.labels(provider="auto", operation="intent").observe(0)
+
+
+def get_metrics_text() -> bytes:
+    """返回 Prometheus text 格式的指标数据"""
+    return generate_latest(_registry)
+
+
+def get_metrics_content_type() -> str:
+    """返回 Prometheus 指标的 Content-Type"""
+    return CONTENT_TYPE_LATEST

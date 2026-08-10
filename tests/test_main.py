@@ -20,6 +20,17 @@ class TestEndpoints:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
+    def test_metrics_endpoint(self):
+        """测试 /metrics 端点返回 Prometheus 格式"""
+        from app.main import app
+        from fastapi.testclient import TestClient
+
+        client = TestClient(app)
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert "text/plain" in response.headers["content-type"]
+        assert b"feishu_bot_" in response.content
+
     @patch("app.main.process_rss_job")
     def test_manual_trigger_rss_endpoint(self, mock_job):
         """测试手动触发 RSS 抓取端点"""

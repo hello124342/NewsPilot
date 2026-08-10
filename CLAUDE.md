@@ -10,9 +10,11 @@ Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news s
 
 **Scheduling:** Articles are fetched and summarized at 5:00 AM daily, then delivered at 9:00 / 12:00 / 18:00 based on each chat's time preference. Multi-layer push filtering: push_time → frequency (daily/weekdays/weekly) → vendor subscription.
 
-**Event receiving:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop. FastAPI serves `/health` and `/admin/trigger-rss` only.
+**Event receiving:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop. FastAPI serves `/health`, `/metrics`, and `/admin/*` endpoints.
 
-**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, Trafilatura, feedparser, httpx, Pytest, Docker.
+**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (36 counters/gauges/histograms across HTTP, LLM, Feishu API, Pipeline, CircuitBreaker, WebSocket), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
+
+**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, Trafilatura, feedparser, httpx, Pytest, Docker, Prometheus, Grafana.
 
 **Code style:** Comments in Chinese, variable/function/class names in English.
 
@@ -28,10 +30,12 @@ Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news s
 | **Builder** | `app/feishu/card_builder.py` | 6 card type builders |
 | **Observer** | `app/feishu/event_router.py` | SDK `EventDispatcherHandler` routes events to typed handlers |
 | **Facade** | `app/subscription/handler.py`, `app/chat/lifecycle.py` | Module-level functions delegate to Repository, preserving backward compat |
+| **Decorator** | `app/core/metrics.py` | `@track_llm_call`, `@track_feishu_api`, `@track_job_metrics` — non-invasive metric instrumentation |
+| **Registry (isolated)** | `app/core/metrics.py` | `CollectorRegistry()` singleton — metrics isolated from global Prometheus registry |
 
 **Concurrency Model:** 3-thread architecture — FastAPI main (uvicorn asyncio), WS daemon (isolated event loop), Event worker pool (ThreadPoolExecutor). Shared state via MySQL/Redis/TTL Cache (threading.Lock). See `docs/concurrency-model.md` for full analysis.
 
-**Architecture Decisions:** 6 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, and thread-pool-over-asyncio.
+**Architecture Decisions:** 7 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, and observability stack.
 
 ## Commands
 
@@ -108,8 +112,10 @@ Two LangGraph workflows drive the system:
 ### Key Modules
 
 **Application Layer:**
-- `app/main.py` — FastAPI entry point, SOURCES config, APScheduler lifecycle (4 jobs), `/feishu/events` webhook, `/admin/trigger-rss` manual trigger
-- `app/core/config.py` — all config via `pydantic-settings` (env vars)
+- `app/main.py` — FastAPI entry point, SOURCES config, APScheduler lifecycle (4 jobs), `/health`, `/metrics`, `/admin/*` endpoints
+- `app/core/config.py` — all config via `pydantic-settings` (env vars): Feishu, LLM, MySQL, Redis, `LOG_LEVEL`
+- `app/core/logging_config.py` — structured JSON logging via `python-json-logger`, configurable `LOG_LEVEL`, suppresses noisy third-party libs
+- `app/core/metrics.py` — 36 Prometheus metrics (counters/gauges/histograms), decorator/context-manager instrumentation, isolated `CollectorRegistry`
 - `app/core/security.py` — [已废弃] Feishu webhook 签名验证，WebSocket 模式无需验签
 
 **Feishu Integration:**
@@ -211,4 +217,31 @@ Commands (Chinese + English, detected via regex in `app/subscription/handler.py`
 
 This project follows **TDD** per the implementation plan in `implementation-plan.md`. The plan defines 7 sequential tasks, each requiring tests written first (`tests/`), then implementation, then `pytest -v` verification.
 
-All 7 tasks are complete. Current test suite: **165 tests passing** across 12 test files.
+All 7 tasks are complete. Current test suite: **~190 tests passing** across 15 test files.
+
+## Monitoring Stack
+
+```bash
+docker-compose up -d --build   # starts app + mysql + redis + prometheus + grafana
+```
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| App Metrics | `http://localhost:8000/metrics` | Prometheus text-format metrics endpoint |
+| Prometheus | `http://localhost:9090` | Metrics collection + query (15s scrape interval) |
+| Grafana | `http://localhost:3000` (admin/admin) | Pre-built dashboard: "Feishu AI News Bot — 运行监控" |
+
+### Metric Categories
+
+| Category | Metrics | Instrumentation |
+|----------|---------|----------------|
+| HTTP | request count + latency by method/path | FastAPI middleware |
+| RSS Pipeline | articles fetched/processed/skipped, job duration, graph errors | Inline in `process_rss_job()` |
+| Deliver Pipeline | cards sent, errors by push_time | Inline in `deliver_job()` |
+| LLM Calls | latency, errors by operation (summarize/intent) | Decorator on `_call_llm_*()` |
+| Feishu API | latency, errors by method/code | Decorator on `_send_card_impl()` |
+| Circuit Breaker | state gauge (CLOSED/OPEN/HALF_OPEN) | `_emit_state_metric()` on transitions |
+| WebSocket | connection status, disconnect count | Inline in `run_ws_client()` |
+| Scraping | success/failure by fetcher_type | Inline in `scrape_article_text()` |
+
+See `docs/adr/0007-observability-stack.md` for design rationale and `monitoring/` for Prometheus + Grafana config files.
