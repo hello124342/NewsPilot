@@ -191,7 +191,7 @@ def handle_message(
             _dispatch_subscription_command(cmd, chat_id, sender_id, feishu_client_obj)
             return
 
-        # 非命令 → 注册 + 欢迎卡片
+        # 非命令 → 注册 + 欢迎卡片，然后继续处理查询（不 return）
         register_chat(chat_id, chat_type="user")
         from app.feishu.card_builder import build_welcome_card
         try:
@@ -200,7 +200,7 @@ def handle_message(
             logger.info(f"User onboarded: {chat_id}, guide card sent")
         except Exception as e:
             logger.error(f"Failed to send user guide card: {e}")
-        return
+        # 继续走到下方的 BotQueryGraph 处理用户的查询
 
     # 已注册 chat → 正常处理
     cmd = detect_command(query_text)
@@ -219,9 +219,16 @@ def handle_message(
     }
     graph = build_query_graph()
     result = graph.invoke(state)
-    logger.info(
-        f"Query processed: '{query_text[:50]}' → {len(result.get('query_results', []))} results"
-    )
+    query_type = result.get("query_type", "list")
+    if query_type == "qa":
+        rag = result.get("rag_answer", {})
+        logger.info(
+            f"Query (qa): '{query_text[:50]}' → {len(rag.get('sources', []))} sources"
+        )
+    else:
+        logger.info(
+            f"Query (list): '{query_text[:50]}' → {len(result.get('query_results', []))} results"
+        )
 
 
 def handle_bot_added(

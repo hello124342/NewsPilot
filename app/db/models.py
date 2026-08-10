@@ -27,6 +27,7 @@ class NewsArticle(Base):
     vendor = Column(String(128), nullable=False, index=True, comment="来源厂商")
     published_at = Column(DateTime, nullable=True, comment="文章发布时间")
     summary_points = Column(Text, nullable=True, comment="LLM 总结要点（换行分隔）")
+    raw_content = Column(Text, nullable=True, comment="文章原始全文（供 RAG 检索和引用）")
 
     # ========== 审计字段 ==========
     is_processed = Column(Boolean, default=True, comment="是否已推送处理")

@@ -414,3 +414,107 @@ def build_group_welcome_card() -> dict:
             },
         ],
     }
+
+
+# ========== RAG 智能问答卡片 ==========
+
+
+def build_rag_answer_card(
+    answer_text: str = "",
+    sources: list[dict] | None = None,
+    original_query: str = "",
+) -> dict:
+    """构建 RAG 智能问答的飞书 Interactive Card
+
+    卡片布局：
+      Header: 🤖 AI 行业情报
+      Body:
+        💬 你问：{original_query}
+        ─────────
+        {answer_text}（Markdown 渲染）
+        ─────────
+        📚 参考来源：
+        [📖 标题一] → URL 按钮
+        [📖 标题二] → URL 按钮
+        ...
+
+    Args:
+        answer_text: LLM 生成的回答正文（Markdown 格式）
+        sources: 引用来源列表 [{title, url, vendor, published_at}]
+        original_query: 用户的原始问题
+
+    Returns:
+        飞书 Interactive Card JSON (dict)
+    """
+    if sources is None:
+        sources = []
+
+    elements = []
+
+    # 用户问题回显
+    if original_query:
+        question_text = original_query[:200] + "..." if len(original_query) > 200 else original_query
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"💬 **你问：** {question_text}"},
+        })
+        elements.append({"tag": "hr"})
+
+    # 答案正文
+    answer_content = answer_text or "暂无答案"
+    # 飞书卡片 lark_md 有 5000 字符限制，截断
+    if len(answer_content) > 4800:
+        answer_content = answer_content[:4800] + "\n\n...（内容过长已截断）"
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": answer_content},
+    })
+
+    # 引用来源
+    if sources:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "📚 **参考来源：**"},
+        })
+        for i, src in enumerate(sources, 1):
+            label_parts = []
+            if src.get("vendor"):
+                label_parts.append(src["vendor"])
+            title_short = src.get("title", "查看原文")[:30]
+            label_parts.append(title_short)
+            label = f"📖 {' · '.join(label_parts)}"
+
+            if src.get("url"):
+                elements.append({
+                    "tag": "action",
+                    "actions": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": label[:40]},
+                        "type": "default",
+                        "url": src["url"],
+                    }],
+                })
+            else:
+                elements.append({
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": f"  {i}. {' · '.join(label_parts)}"},
+                })
+    else:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [{
+                "tag": "plain_text",
+                "content": "💡 发送「OpenAI 最近有什么新闻」查看最新动态",
+            }],
+        })
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green",
+            "title": {"tag": "plain_text", "content": "🤖 AI 行业情报"},
+        },
+        "elements": elements,
+    }

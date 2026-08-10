@@ -149,6 +149,45 @@ scrape_failure_total = Counter(
     registry=_registry,
 )
 
+# ========== RAG (Retrieval-Augmented Generation) ==========
+
+rag_embed_duration_seconds = Histogram(
+    "feishu_bot_rag_embed_duration_seconds",
+    "RAG embedding API call latency in seconds",
+    registry=_registry,
+)
+
+rag_embed_total = Counter(
+    "feishu_bot_rag_embed_total",
+    "Total RAG embedding calls",
+    registry=_registry,
+)
+
+rag_embed_errors_total = Counter(
+    "feishu_bot_rag_embed_errors_total",
+    "Total RAG embedding call errors",
+    registry=_registry,
+)
+
+rag_retrieve_duration_seconds = Histogram(
+    "feishu_bot_rag_retrieve_duration_seconds",
+    "RAG semantic retrieval latency in seconds",
+    registry=_registry,
+)
+
+rag_answer_duration_seconds = Histogram(
+    "feishu_bot_rag_answer_duration_seconds",
+    "RAG LLM answer generation latency in seconds",
+    registry=_registry,
+)
+
+rag_query_total = Counter(
+    "feishu_bot_rag_query_total",
+    "Total RAG queries by type",
+    ["query_type"],
+    registry=_registry,
+)
+
 # ========== HTTP Middleware ==========
 
 http_requests_total = Counter(
@@ -321,6 +360,12 @@ def init_metrics() -> None:
     # LLM
     llm_call_duration_seconds.labels(provider="auto", operation="summarize").observe(0)
     llm_call_duration_seconds.labels(provider="auto", operation="intent").observe(0)
+
+    # RAG
+    rag_embed_total.inc(0)
+    rag_embed_errors_total.inc(0)
+    rag_query_total.labels(query_type="list").inc(0)
+    rag_query_total.labels(query_type="qa").inc(0)
 
 
 def get_metrics_text() -> bytes:

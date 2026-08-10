@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI):
     database.init_db(settings)
     from app.db.models import Base
     Base.metadata.create_all(bind=database.engine)
+    database._run_migrations()
     logger.info("Database initialized: tables created")
 
     # 初始化 Prometheus 指标为零值（确保 Grafana 中不显示 "No data"）
@@ -219,6 +220,82 @@ async def trigger_rss():
     """手动触发 RSS 抓取（便于调试）"""
     result = process_rss_job()
     return JSONResponse(result)
+
+
+@app.post("/admin/backfill-chromadb")
+async def backfill_chromadb(max_articles: int = 0):
+    """回填已有文章到 ChromaDB 向量库
+
+    遍历 MySQL 中已有但未在 ChromaDB 中的文章，逐条生成 embedding 并写入。
+    用于现有数据库的 RAG 初始化或 ChromaDB 修复。
+
+    Args:
+        max_articles: 最多回填 N 篇（0=全部）。每篇调用一次 embedding API，注意 OpenAI 计费。
+    """
+    import logging as _logging
+    _logger = _logging.getLogger("backfill")
+    from app.db.database import SessionLocal
+    from app.db.models import NewsArticle
+    from app.rag.embedder import get_embedding, build_article_embed_text
+    from app.rag.vector_store import add_article, collection_count
+
+    db = SessionLocal()
+    try:
+        # 查询所有文章（标题+摘要即可用于 embedding，不依赖 raw_content）
+        query = db.query(NewsArticle).order_by(NewsArticle.published_at.desc())
+
+        if max_articles > 0:
+            query = query.limit(max_articles)
+
+        articles = query.all()
+        _logger.info(f"Backfill: {len(articles)} articles to process")
+
+        chroma_before = collection_count()
+        embedded = 0
+        skipped = 0
+
+        for article in articles:
+            # 构建 embedding 文本（标题+摘要，与 store_node 一致）
+            summary = article.summary_points or ""
+            embed_text = build_article_embed_text(
+                title=article.title,
+                vendor=article.vendor,
+                summary_points=summary,
+                channel="",  # 回填不区分 Blog/Twitter
+            )
+
+            try:
+                embedding = get_embedding(embed_text)
+                add_article(
+                    article_id=article.id,
+                    embedding=embedding,
+                    document=embed_text,
+                    metadata={
+                        "vendor": article.vendor,
+                        "title": article.title,
+                        "url": article.url or "",
+                        "published_at": article.published_at.strftime("%Y-%m-%d") if article.published_at else "",
+                        "channel": "",
+                    },
+                )
+                embedded += 1
+            except ValueError:
+                skipped += 1
+            except Exception as exc:
+                _logger.warning(f"Backfill: article {article.id} failed: {exc}")
+                skipped += 1
+
+        chroma_after = collection_count()
+        return JSONResponse({
+            "status": "ok",
+            "total_articles": len(articles),
+            "embedded": embedded,
+            "skipped": skipped,
+            "chromadb_before": chroma_before,
+            "chromadb_after": chroma_after,
+        })
+    finally:
+        db.close()
 
 
 @app.post("/admin/trigger-push")

@@ -1,5 +1,19 @@
 > **状态：已完成（2026-08-08），实际实现超出 v1 范围**
-> 本计划定义 7 个 Task 已全部交付。后续新增功能（未在计划中）：
+> 本计划定义 7 个 Task 已全部交付。
+>
+> **v2 新增（2026-08-09）：**
+> - RAG 智能问答：ChromaDB 向量库 + OpenAI Embedding + LLM 综合回答带引用
+> - 意图路由：LLM 分类 + 关键词降级，list (查列表) / qa (智能问答) 双路径
+> - 7 种飞书卡片：新增 `build_rag_answer_card()` 问答卡片
+> - 42 项 Prometheus 指标（新增 6 项 RAG 指标）
+> - 数据库自动迁移：`_run_migrations()` 启动时检测 + 补全缺失列
+>
+> **v2.1 Bug 修复（2026-08-10）：**
+> - 日期边界修复：`timedelta(days=N)` → 日历日 `00:00 UTC` 边界（`_calc_since()`）
+> - 意图解析增强：Prompt 添加 "今天/昨天" 示例，降级时 `_extract_days_from_query()` 关键词提取
+> - MySQL `raw_content` 列自动迁移
+>
+> 后续新增功能（未在计划中）：
 > Twitter/Nitter 支持、订阅系统、推送时间/频率定制、Bot 自动发现、权限控制、双阶段推送。
 > 最新架构见 [CLAUDE.md](./CLAUDE.md)。
 
