@@ -9,12 +9,53 @@ SDK 自动管理 tenant_access_token（获取、缓存、续期），无需手�
 """
 import json
 import logging
+import time as _time
 from typing import Optional
 
 import lark_oapi as lark
 from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _track_feishu_api(method: str):
+    """飞书 API 调用埋点 decorator，记录耗时和按错误码分类的错误"""
+    import functools
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            start = _time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = _time.perf_counter() - start
+                _emit_feishu_duration(method, elapsed)
+                return result
+            except Exception as e:
+                elapsed = _time.perf_counter() - start
+                _emit_feishu_duration(method, elapsed)
+                _emit_feishu_error(method, type(e).__name__)
+                raise
+        return wrapper
+    return decorator
+
+
+def _emit_feishu_duration(method: str, elapsed: float) -> None:
+    """发送 API 耗时到 Prometheus"""
+    try:
+        from app.core.metrics import feishu_api_duration_seconds
+        feishu_api_duration_seconds.labels(method=method).observe(elapsed)
+    except ImportError:
+        pass
+
+
+def _emit_feishu_error(method: str, code: str) -> None:
+    """发送 API 错误到 Prometheus"""
+    try:
+        from app.core.metrics import feishu_api_errors_total
+        feishu_api_errors_total.labels(method=method, code=code).inc()
+    except ImportError:
+        pass
 
 
 class FeishuClient:
@@ -85,6 +126,7 @@ class FeishuClient:
         logger.debug(f"Card sent to {receive_id}")
         return {"code": response.code, "msg": response.msg}
 
+    @_track_feishu_api("send_card")
     def _send_card_impl(self, request) -> lark.BaseResponse:
         """send_card 的实际 API 调用（供熔断器包装）"""
         response = self._client.im.v1.message.create(request)

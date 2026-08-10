@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     MYSQL_PASSWORD: str = ""
     MYSQL_DATABASE: str = "lark_news"
 
+    # ========== 可观测性配置 ==========
+    LOG_LEVEL: str = "INFO"  # DEBUG | INFO | WARNING | ERROR
+
     # ========== Redis 配置 ==========
     REDIS_HOST: str = "127.0.0.1"
     REDIS_PORT: int = 6379

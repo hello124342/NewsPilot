@@ -55,6 +55,7 @@ class CircuitBreaker:
         self.failure_count = 0
         self.last_failure_time = 0.0
         self._lock = threading.Lock()
+        self._emit_state_metric()  # 初始化时发射 CLOSED 状态
 
     def call(self, func: Callable[..., T], *args, **kwargs) -> T:
         """通过熔断器调用函数
@@ -104,6 +105,7 @@ class CircuitBreaker:
                 logger.info(f"[CB:{self.name}] HALF_OPEN → CLOSED (probe succeeded)")
             self.state = CircuitState.CLOSED
             self.failure_count = 0
+            self._emit_state_metric()
 
     def _on_failure(self) -> None:
         """调用失败 → 更新失败计数"""
@@ -121,6 +123,18 @@ class CircuitBreaker:
                         f"(failures={self.failure_count}/{self.failure_threshold})"
                     )
                 self.state = CircuitState.OPEN
+            self._emit_state_metric()
+
+    def _emit_state_metric(self) -> None:
+        """将当前状态推送到 Prometheus gauge（延迟导入避免循环依赖）"""
+        try:
+            from app.core.metrics import cb_state
+            state_map = {"CLOSED": 0, "OPEN": 1, "HALF_OPEN": 2}
+            cb_state.labels(cb_name=self.name).set(
+                state_map.get(self.state.name, -1)
+            )
+        except ImportError:
+            pass  # metrics 模块不可用时静默跳过
 
     @property
     def status(self) -> dict:

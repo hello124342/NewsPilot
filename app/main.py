@@ -14,14 +14,13 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.core.config import Settings
+from app.core.logging_config import setup_logging
 from app.db.redis import RedisClient
 import app.db.database as database
 from app.graph.state import PushState
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# 结构化日志：JSON 格式输出，LOG_LEVEL 通过环境变量控制
+setup_logging(Settings())
 logger = logging.getLogger(__name__)
 
 # ========== 信源配置 ==========
@@ -55,6 +54,10 @@ async def lifespan(app: FastAPI):
     from app.db.models import Base
     Base.metadata.create_all(bind=database.engine)
     logger.info("Database initialized: tables created")
+
+    # 初始化 Prometheus 指标为零值（确保 Grafana 中不显示 "No data"）
+    from app.core.metrics import init_metrics
+    init_metrics()
 
     # --- 启动 APScheduler ---
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -101,6 +104,10 @@ async def lifespan(app: FastAPI):
         app_secret=settings.FEISHU_APP_SECRET,
         event_handler=event_handler,
     )
+
+    # 注册到 /health 可访问的模块级引用
+    _app_services["circuit_breaker"] = feishu_cb
+    _app_services["ws_thread"] = ws_thread
     logger.info(f"Feishu WS long connection started (thread: {ws_thread.name})")
 
     yield
@@ -114,22 +121,97 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Feishu AI News Bot", version="0.2.0", lifespan=lifespan)
 
 
-# ========== 管理接口 ==========
+# ========== 可观测性：HTTP 指标中间件 ==========
+
+import time as _time
+from app.core.metrics import http_requests_total, http_request_duration_seconds
+
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    """统计 HTTP 请求数和延迟，排除 /metrics 自身"""
+    path = request.url.path
+    if path == "/metrics":
+        return await call_next(request)
+    start = _time.perf_counter()
+    response = await call_next(request)
+    elapsed = _time.perf_counter() - start
+    http_requests_total.labels(
+        method=request.method, path=path, status=str(response.status_code)
+    ).inc()
+    http_request_duration_seconds.labels(method=request.method, path=path).observe(elapsed)
+    return response
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点（text/plain 格式）"""
+    from app.core.metrics import get_metrics_text, get_metrics_content_type
+    from fastapi.responses import Response
+    return Response(content=get_metrics_text(), media_type=get_metrics_content_type())
+
+
+# ========== 健康检查端点 ==========
+
+# 模块级引用：lifecycle 期间设置，供 /health 端点读取
+_app_services: dict = {}
+
 
 @app.get("/health")
 async def health():
-    """健康检查（含熔断器状态）"""
-    from app.core.resilience import CircuitBreaker
-    # 获取 feishu_cb 状态（从 lifespan 中捕获的变量通过闭包不可达，直接创建临时引用）
-    return {
-        "status": "ok",
-    }
+    """健康检查（Kubernetes liveness probe）"""
+    return {"status": "ok"}
 
 
 @app.get("/health/detailed")
 async def health_detailed():
-    """详细健康检查：熔断器状态、数据库连接等"""
-    return {"status": "ok", "detail": "use /health for liveness, this is for debugging"}
+    """详细健康检查：数据库、Redis、熔断器、WebSocket 线程状态"""
+    result = {
+        "status": "ok",
+        "database": _check_database(),
+        "redis": _check_redis(),
+        "circuit_breaker": _check_circuit_breaker(),
+    }
+
+    # 如果任何组件不健康，整体状态设为 degraded
+    checks = [result["database"], result["redis"], result["circuit_breaker"]]
+    if any(c["status"] != "healthy" for c in checks if isinstance(c, dict)):
+        result["status"] = "degraded"
+
+    return result
+
+
+def _check_database() -> dict:
+    """检查 MySQL 数据库连接"""
+    try:
+        from app.db.database import engine
+        with engine.connect() as conn:
+            conn.execute(engine.dialect.do_ping(None))
+        return {"status": "healthy"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _check_redis() -> dict:
+    """检查 Redis 连接"""
+    try:
+        from app.db.redis import RedisClient
+        from app.core.config import Settings
+        settings = Settings()
+        redis = RedisClient(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
+        if redis._client.ping():
+            return {"status": "healthy"}
+        return {"status": "unhealthy", "error": "ping failed"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+def _check_circuit_breaker() -> dict:
+    """返回熔断器状态"""
+    cb = _app_services.get("circuit_breaker")
+    if cb is None:
+        return {"status": "not_configured"}
+    return {"status": "healthy", **cb.status}
 
 
 @app.post("/admin/trigger-rss")
@@ -178,10 +260,16 @@ def process_rss_job() -> dict:
     Returns:
         {"status": "ok", "processed": N} 或 {"status": "error", "message": str}
     """
+    import time as _time
     from app.fetcher.rss_fetcher import fetch_rss_items
     from app.fetcher.kimi_scraper import fetch_kimi_articles
     from app.graph.news_push_graph import build_push_graph
+    from app.core.metrics import (
+        rss_articles_fetched_total, rss_articles_processed_total,
+        rss_articles_skipped_total, rss_graph_errors_total, rss_job_duration_seconds,
+    )
 
+    start_time = _time.perf_counter()
     settings = Settings()  # type: ignore[call-arg]
     redis = RedisClient(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
     graph = build_push_graph(push_enabled=False)  # 仅抓取+存储，不推送
@@ -193,6 +281,7 @@ def process_rss_job() -> dict:
         vendor = source["vendor"]
         channel = source.get("channel", "Blog")
         keywords = source.get("filter")
+        source_label = f"{vendor}_{channel}"
 
         # 根据 fetcher 类型拉取文章列表
         if fetcher_type == "kimi":
@@ -200,17 +289,20 @@ def process_rss_job() -> dict:
         else:
             articles = fetch_rss_items(rss_url)
 
+        rss_articles_fetched_total.labels(source=source_label).inc(len(articles))
         logger.info(f"[{vendor}] {channel}: fetched {len(articles)} articles from {rss_url}")
 
         for article in articles:
             url = article["url"]
             if not url or redis.is_url_processed(url):
+                rss_articles_skipped_total.inc()
                 continue
 
             # 关键词过滤
             if keywords:
                 title_lower = article["title"].lower()
                 if not any(kw.lower() in title_lower for kw in keywords):
+                    rss_articles_skipped_total.inc()
                     continue
 
             # 构建初始状态，通过 LangGraph 流水线处理
@@ -228,6 +320,7 @@ def process_rss_job() -> dict:
                 result = graph.invoke(state)
                 if result.get("status") == "SUCCESS":
                     processed_count += 1
+                    rss_articles_processed_total.inc()
                 else:
                     logger.warning(
                         f"Pipeline failed for: {article['title'][:50]} "
@@ -235,9 +328,12 @@ def process_rss_job() -> dict:
                     )
             except Exception as e:
                 logger.error(f"Graph invocation failed for {url}: {e}")
+                rss_graph_errors_total.labels(source=source_label).inc()
                 continue
 
-    logger.info(f"RSS job complete: {processed_count} articles processed")
+    elapsed = _time.perf_counter() - start_time
+    rss_job_duration_seconds.observe(elapsed)
+    logger.info(f"RSS job complete: {processed_count} articles processed in {elapsed:.1f}s")
     return {"status": "ok", "processed": processed_count}
 
 
@@ -256,6 +352,7 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
     1. 查询今日存储的所有文章
     2. 对每篇文章，按 推送时间 → 频率 → 订阅 三层过滤后推送
     """
+    import time as _time
     from datetime import date, datetime, timezone
     from app.db.database import SessionLocal
     from app.db.models import NewsArticle
@@ -266,12 +363,15 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
     from app.feishu.card_builder import build_news_card
     from app.feishu.client import FeishuClient
     from app.chat.lifecycle import get_active_chat_ids
+    from app.core.metrics import deliver_cards_sent_total, deliver_errors_total, deliver_job_duration_seconds
 
+    start_time = _time.perf_counter()
     settings = Settings()  # type: ignore[call-arg]
 
     chat_ids = get_active_chat_ids()
     if not chat_ids:
         logger.info(f"deliver_job({push_time}): no active chats")
+        deliver_job_duration_seconds.labels(push_time=push_time).observe(_time.perf_counter() - start_time)
         return {"status": "ok", "delivered": 0}
     logger.info(f"deliver_job({push_time}): targeting {len(chat_ids)} active chat(s)")
 
@@ -295,6 +395,7 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
 
     if not articles:
         logger.info(f"deliver_job({push_time}): no articles to deliver")
+        deliver_job_duration_seconds.labels(push_time=push_time).observe(_time.perf_counter() - start_time)
         return {"status": "ok", "delivered": 0}
 
     delivered = 0
@@ -329,11 +430,15 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
                 )
                 feishu.send_card(chat_id, card)
                 delivered += 1
+                deliver_cards_sent_total.labels(push_time=push_time).inc()
             except Exception as e:
                 logger.warning(f"deliver_job send failed for {article.url} to {chat_id}: {e}")
+                deliver_errors_total.labels(push_time=push_time).inc()
 
             if limit and delivered >= limit:
                 break
 
+    elapsed = _time.perf_counter() - start_time
+    deliver_job_duration_seconds.labels(push_time=push_time).observe(elapsed)
     logger.info(f"deliver_job({push_time}): {delivered} cards sent, {len(articles)} articles, limit={limit}")
     return {"status": "ok", "delivered": delivered}
