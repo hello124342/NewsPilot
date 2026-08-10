@@ -4,17 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes Interactive Cards to Feishu (Lark). Supports @Bot queries from within Feishu groups.
+Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes Interactive Cards to Feishu (Lark). Supports @Bot queries from within Feishu groups, with RAG-powered semantic search and AI-assisted Q&A.
 
-**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Dynamic chat discovery via Feishu WebSocket long connection (no hardcoded chat IDs). Per-chat vendor subscriptions with push time & frequency customization. Group owner permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek).
+**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Dynamic chat discovery via Feishu WebSocket long connection (no hardcoded chat IDs). Per-chat vendor subscriptions with push time & frequency customization. Group owner permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek). RAG intelligent Q&A — semantic search (ChromaDB + OpenAI embeddings) with LLM-generated answers with citations. Intent routing: auto-classifies queries as "list search" vs "natural language Q&A".
 
 **Scheduling:** Articles are fetched and summarized at 5:00 AM daily, then delivered at 9:00 / 12:00 / 18:00 based on each chat's time preference. Multi-layer push filtering: push_time → frequency (daily/weekdays/weekly) → vendor subscription.
 
 **Event receiving:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop. FastAPI serves `/health`, `/metrics`, and `/admin/*` endpoints.
 
-**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (36 counters/gauges/histograms across HTTP, LLM, Feishu API, Pipeline, CircuitBreaker, WebSocket), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
+**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (42 counters/gauges/histograms across HTTP, LLM, Feishu API, Pipeline, CircuitBreaker, WebSocket, RAG), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
 
-**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, Trafilatura, feedparser, httpx, Pytest, Docker, Prometheus, Grafana.
+**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, Trafilatura, feedparser, httpx, ChromaDB, OpenAI embeddings, Pytest, Docker, Prometheus, Grafana.
 
 **Code style:** Comments in Chinese, variable/function/class names in English.
 
@@ -27,15 +27,18 @@ Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news s
 | **Producer-Consumer** | `app/feishu/event_router.py` | `ThreadPoolExecutor(max_workers=5)` offloads event processing from WS thread |
 | **Factory** | `app/llm/provider.py` | `get_llm()` returns provider-specific `BaseChatModel` |
 | **Strategy** | `app/fetcher/` | RSS vs Kimi HTML scraper selected by `source["fetcher"]` |
-| **Builder** | `app/feishu/card_builder.py` | 6 card type builders |
+| **Builder** | `app/feishu/card_builder.py` | 7 card type builders (news, RAG answer, subscription, welcome, settings) |
 | **Observer** | `app/feishu/event_router.py` | SDK `EventDispatcherHandler` routes events to typed handlers |
 | **Facade** | `app/subscription/handler.py`, `app/chat/lifecycle.py` | Module-level functions delegate to Repository, preserving backward compat |
 | **Decorator** | `app/core/metrics.py` | `@track_llm_call`, `@track_feishu_api`, `@track_job_metrics` — non-invasive metric instrumentation |
 | **Registry (isolated)** | `app/core/metrics.py` | `CollectorRegistry()` singleton — metrics isolated from global Prometheus registry |
+| **Strategy (intent routing)** | `app/graph/nodes/intent_router.py` | LLM classification + keyword heuristic fallback: list vs qa routing |
 
 **Concurrency Model:** 3-thread architecture — FastAPI main (uvicorn asyncio), WS daemon (isolated event loop), Event worker pool (ThreadPoolExecutor). Shared state via MySQL/Redis/TTL Cache (threading.Lock). See `docs/concurrency-model.md` for full analysis.
 
-**Architecture Decisions:** 7 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, and observability stack.
+**Architecture Decisions:** 8 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, observability stack, and RAG upgrade.
+
+**Database Migrations:** Lightweight auto-migration in `app/db/database.py:_run_migrations()` — detects missing columns on startup and applies ALTER TABLE. Safe, idempotent, no external migration framework needed.
 
 ## Commands
 
@@ -102,11 +105,19 @@ Two LangGraph workflows drive the system:
    - Supports checkpointing (`enable_checkpoint`) and human-in-the-loop (`enable_human_review`)
    - Conditional edges: FAILED status routes directly to END
 
-2. **BotQueryGraph** (`app/graph/bot_query_graph.py`) — interactive pipeline:
-   `[Start Webhook] → ParseIntentNode → SearchDBNode → FormatResponseNode → ReplyFeishuNode → [End]`
-   - `intent.py` — parses user NL into structured query (vendor via alias map, date range), LLM with 3x retry + keyword fallback
-   - `search_db.py` — queries MySQL for matching articles by vendor + date range
+2. **BotQueryGraph** (`app/graph/bot_query_graph.py`) — interactive pipeline with conditional routing:
+   ```
+   [Start] → IntentRouterNode
+                ├─ "list" → IntentNode → SearchDBNode → FormatResponseNode → ReplyFeishuNode → [End]
+                └─ "qa"   → RAGRetrieveNode → RAGAnswerNode → FormatRAGResponseNode → ReplyFeishuNode → [End]
+   ```
+   - `intent_router.py` — **NEW** — LLM 3-class classification (list/qa/command) with 2x retry + keyword heuristic fallback
+   - `intent.py` — parses user NL into structured query (vendor via alias map, date range `_extract_days_from_query()`), LLM with 3x retry + keyword fallback
+   - `search_db.py` — queries MySQL for matching articles by vendor + calendar day range (`_calc_since()` uses 00:00 UTC boundaries)
+   - `rag_retrieve.py` — **NEW** — semantic search: query embedding → ChromaDB top-K → MySQL backfill `raw_content`
+   - `rag_answer.py` — **NEW** — LLM reads context + user question → comprehensive answer with `[来源 N]` citations
    - `format_response.py` — builds multi-article result card (or "未找到" empty card)
+   - `format_rag_response.py` — **NEW** — wraps RAG answer into `build_rag_answer_card()`
    - `reply_feishu.py` — sends reply card to chat_id from QueryState
 
 ### Key Modules
@@ -120,9 +131,14 @@ Two LangGraph workflows drive the system:
 
 **Feishu Integration:**
 - `app/feishu/client.py` — Feishu Open API via `lark-oapi` SDK, auto-managed token
-- `app/feishu/card_builder.py` — card builders: `build_news_card()` (Plan A), `build_subscription_reply()`, `build_subscription_list_card()`, `build_welcome_card()`, `build_group_welcome_card()`, `build_settings_card()`
-- `app/feishu/event_router.py` — WebSocket event dispatcher: typed SDK handlers for messages, card actions, bot lifecycle events. Events dispatched via `ThreadPoolExecutor`
+- `app/feishu/card_builder.py` — card builders: `build_news_card()` (Plan A), `build_rag_answer_card()` (RAG Q&A), `build_subscription_reply()`, `build_subscription_list_card()`, `build_welcome_card()`, `build_group_welcome_card()`, `build_settings_card()`
+- `app/feishu/event_router.py` — WebSocket event dispatcher: typed SDK handlers for messages, card actions, bot lifecycle events. Events dispatched via `ThreadPoolExecutor`. Fixed first-message bug (welcome card no longer blocks query processing)
 - `app/feishu/ws_client.py` — WS thread manager: independent event loop, auto-reconnect with exponential backoff, daemon thread for FastAPI coexistence
+
+**RAG (Retrieval-Augmented Generation):**
+- `app/rag/embedder.py` — OpenAI `text-embedding-3-small` (1536-dim) via `openai.OpenAI` client, 3x retry, Prometheus metrics
+- `app/rag/vector_store.py` — ChromaDB `PersistentClient` (local `./chroma_data/`), CRUD operations: `add_article()`, `search()`, `delete_article()`, `collection_count()`
+- `app/prompts/rag_answer.yaml` — RAG answer prompt with citation rules
 
 **Data Fetching:**
 - `app/fetcher/rss_fetcher.py` — RSS/Atom parsing via feedparser, `detect_vendor()` utility
@@ -130,8 +146,8 @@ Two LangGraph workflows drive the system:
 - `app/fetcher/web_scraper.py` — article full-text extraction via Trafilatura (3x exponential backoff)
 
 **Storage:**
-- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle`, `Subscription`, `ChatPreference`, `ChatRegistry`
-- `app/db/database.py` — SQLAlchemy session factory
+- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle` (with `raw_content` column for RAG), `Subscription`, `ChatPreference`, `ChatRegistry`
+- `app/db/database.py` — SQLAlchemy session factory + `_run_migrations()` auto-migration for missing columns
 - `app/db/redis.py` — URL dedup cache (Redis Set) + `tenant_access_token` cache
 - `app/db/repositories.py` — Repository ABC interfaces (`SubscriptionRepository`, `ChatRegistryRepository`)
 - `app/db/sql_repositories.py` — SQLAlchemy Repository implementations; `replace_repos()` for test injection
@@ -140,15 +156,53 @@ Two LangGraph workflows drive the system:
 
 **LLM:**
 - `app/llm/provider.py` — Factory for multi-provider LLM (OpenAI/Anthropic/DeepSeek), returns `BaseChatModel`
-- `app/prompts/loader.py` — YAML-based prompt template loader (`intent.yaml`, `summarize.yaml`)
+- `app/prompts/loader.py` — YAML-based prompt template loader (`intent.yaml`, `summarize.yaml`, `rag_answer.yaml`)
 
 **Subscription & Chat Management:**
 - `app/subscription/handler.py` — subscribe/unsubscribe/list commands, vendor aliases (12+ mappings), command regex detection, push time/frequency preferences. Constant: `ALL_VENDORS`, `PUSH_TIMES` (09:00/12:00/18:00), `FREQUENCIES` (daily/weekdays/weekly_monday)
 - `app/chat/lifecycle.py` — chat auto-registration on bot added, deactivation on bot removed, active chat queries, owner_id caching, permission check (`can_manage_subscription()`)
 
-**State definitions** are in `app/graph/state.py` — `PushState` (raw_url, raw_content, vendor, title, published_at, summary_points, card_json, status) and `QueryState` (user_id, chat_id, user_query, parsed_intent, query_results, reply_card_json) TypedDicts.
+**State definitions** are in `app/graph/state.py` — `PushState` (raw_url, raw_content, vendor, title, published_at, summary_points, card_json, status) and `QueryState` (user_id, chat_id, user_query, parsed_intent, query_results, query_type, rag_context, rag_answer, reply_card_json) TypedDicts.
 
-**Error handling:** 3x exponential backoff on scraping, LangGraph node-level retry for 429 Rate Limit, auto-refreshing Feishu token in Redis. URL marked processed only after successful card send (or when zero subscribers, to prevent infinite reprocessing).
+**Error handling:** 3x exponential backoff on scraping, LangGraph node-level retry for 429 Rate Limit, auto-refreshing Feishu token in Redis. URL marked processed only after successful card send (or when zero subscribers, to prevent infinite reprocessing). RAG embedding failures are logged but don't block the main news processing pipeline.
+
+### RAG Query Flow
+
+```
+User: "GPT-5 什么时候发布？"
+       │
+       ▼
+intent_router: ──"qa"──→ rag_retrieve               ┌──────────────────────┐
+                            │                         │ ChromaDB             │
+                            ├─ get_embedding(query)   │ (PersistentClient)   │
+                            ├─ search(top_k=5) ──────→│ ./chroma_data/       │
+                            ├─ _backfill_raw_content  │ 1536-dim vectors     │
+                            │  (MySQL JOIN)           └──────────────────────┘
+                            ▼
+                          rag_answer
+                            ├─ _build_context_text(context)
+                            ├─ LLM reads context + question
+                            ├─ _extract_sources(context)
+                            ▼
+                          format_rag_response → reply_feishu
+                            │
+                            ▼
+                    ┌─────────────────────────────┐
+                    │ 🤖 AI 行业情报 (green)       │
+                    │ 💬 GPT-5 什么时候发布？      │
+                    │ ...LLM answer...             │
+                    │ 📚 [来源1] [来源2] [来源3]    │
+                    └─────────────────────────────┘
+```
+
+## Admin Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/admin/trigger-rss` | POST | Manually trigger RSS fetch + summarize + store |
+| `/admin/trigger-push?time=09:00&limit=N` | POST | Manually trigger card delivery for a time slot |
+| `/admin/test-card?chat_id=xxx` | POST | Send a test card to verify button interactions |
+| `/admin/backfill-chromadb?max_articles=N` | POST | Backfill existing MySQL articles into ChromaDB |
 
 ## Data Sources
 
@@ -192,6 +246,7 @@ Additional card types in `app/feishu/card_builder.py`:
 - **Subscription list** — `build_subscription_list_card(subscribed)` showing all 6 vendors with status
 - **Welcome cards** — `build_welcome_card()` (private chat) and `build_group_welcome_card()` (group onboarding)
 - **Settings panel** — `build_settings_card(subscribed, push_time, frequency)` with interactive time/freq buttons
+- **RAG Answer** — `build_rag_answer_card(answer_text, sources, original_query)` with 🤖 AI 行业情报 header (green), user question, LLM answer with citation markers, and 📚 source buttons linking to original articles
 
 ## Subscription System
 
@@ -217,7 +272,7 @@ Commands (Chinese + English, detected via regex in `app/subscription/handler.py`
 
 This project follows **TDD** per the implementation plan in `implementation-plan.md`. The plan defines 7 sequential tasks, each requiring tests written first (`tests/`), then implementation, then `pytest -v` verification.
 
-All 7 tasks are complete. Current test suite: **~190 tests passing** across 15 test files.
+All 7 tasks are complete. RAG upgrade (+5 phases) and query accuracy bug fixes delivered. Current test suite: **247 tests passing** across 17 test files.
 
 ## Monitoring Stack
 
@@ -238,10 +293,11 @@ docker-compose up -d --build   # starts app + mysql + redis + prometheus + grafa
 | HTTP | request count + latency by method/path | FastAPI middleware |
 | RSS Pipeline | articles fetched/processed/skipped, job duration, graph errors | Inline in `process_rss_job()` |
 | Deliver Pipeline | cards sent, errors by push_time | Inline in `deliver_job()` |
-| LLM Calls | latency, errors by operation (summarize/intent) | Decorator on `_call_llm_*()` |
+| LLM Calls | latency, errors by operation (summarize/intent/router/rag_answer) | Decorator on `_call_llm_*()` |
 | Feishu API | latency, errors by method/code | Decorator on `_send_card_impl()` |
 | Circuit Breaker | state gauge (CLOSED/OPEN/HALF_OPEN) | `_emit_state_metric()` on transitions |
 | WebSocket | connection status, disconnect count | Inline in `run_ws_client()` |
 | Scraping | success/failure by fetcher_type | Inline in `scrape_article_text()` |
+| RAG | embed duration/errors/total, retrieve duration, answer duration, query total by type | Inline in `embedder.py`, `rag_retrieve.py`, `rag_answer.py` |
 
 See `docs/adr/0007-observability-stack.md` for design rationale and `monitoring/` for Prometheus + Grafana config files.

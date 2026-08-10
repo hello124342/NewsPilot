@@ -3,11 +3,31 @@
 根据意图解析结果查询 MySQL，获取匹配的新闻文章。
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from app.graph.state import QueryState
 from app.db.database import SessionLocal
 
 logger = logging.getLogger(__name__)
+
+
+def _calc_since(days: int) -> datetime:
+    """计算查询起始时间（日历日边界，00:00:00 UTC）
+
+    days 语义：回溯 N 个日历日（含今天）
+    - days=1 → today 00:00 UTC（仅今天）
+    - days=3 → (today - 2 days) 00:00 UTC（最近3个日历日）
+    - days=7 → (today - 6 days) 00:00 UTC（最近一周）
+
+    这避免了 timedelta(days=N) 从「此刻」精确倒退 N*24h
+    导致的「昨天上午的文章被截断」问题。
+    """
+    # 防御性校验
+    if not isinstance(days, int) or days < 1:
+        days = 3
+
+    today = date.today()
+    since_date = today - timedelta(days=days - 1)
+    return datetime.combine(since_date, datetime.min.time(), tzinfo=timezone.utc)
 
 
 def search_db_node(state: QueryState) -> QueryState:
@@ -33,8 +53,8 @@ def search_db_node(state: QueryState) -> QueryState:
         if vendor:
             query = query.filter(NewsArticle.vendor == vendor)
 
-        # 按时间范围过滤
-        since = datetime.now(timezone.utc) - timedelta(days=days)
+        # 按时间范围过滤（日历日边界）
+        since = _calc_since(days)
         query = query.filter(NewsArticle.published_at >= since)
 
         # 按发布时间倒序
@@ -53,7 +73,7 @@ def search_db_node(state: QueryState) -> QueryState:
         ]
         logger.info(
             f"Query results: {len(articles)} articles "
-            f"(vendor={vendor}, days={days})"
+            f"(vendor={vendor}, days={days}, since={since.strftime('%Y-%m-%d')})"
         )
     except Exception as e:
         logger.error(f"search_db_node failed: {e}")

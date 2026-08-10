@@ -30,6 +30,9 @@ class QueryState(TypedDict, total=False):
     user_id: str          # 触发用户 ID
     chat_id: str          # 群聊 / 单聊 ID
     user_query: str       # 用户输入的原始文本
+    query_type: str       # 意图分类: "list" | "qa"
     parsed_intent: dict   # LLM 解析出的查询条件 {"vendor": str, "days": int}
-    query_results: list[dict]  # 数据库查询结果
-    reply_card_json: dict     # 回复卡片 JSON
+    query_results: list[dict]  # 数据库查询结果（list 路径使用）
+    rag_context: list[dict]    # RAG 检索到的文章上下文（qa 路径使用）
+    rag_answer: dict           # RAG 答案 {"answer_text": str, "sources": list[dict]}
+    reply_card_json: dict      # 回复卡片 JSON

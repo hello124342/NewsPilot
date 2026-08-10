@@ -35,3 +35,6 @@ Thumbs.db
 
 # Lock files (auto-generated)
 requirements-lock.txt
+
+# ChromaDB 向量库数据
+chroma_data/

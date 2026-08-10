@@ -7,11 +7,12 @@
 - **10 数据源 / 6 厂商** — Blog RSS + Twitter (Nitter) 混合监控
 - **LLM 智能摘要** — LangGraph StateGraph 管道，3 核心要点提炼
 - **飞书 Interactive Card** — Plan A 风格卡片，按钮交互（订阅/设置/退订）
-- **交互式 @Bot 查询** — 按厂商 + 日期 NL 检索历史
+- **交互式 @Bot 查询** — 按厂商 + 日期 NL 检索历史 + RAG 智能问答（语义检索 + LLM 综合回答带引用）
 - **订阅管理** — 厂商粒度的订阅/退订，群主权限控制
 - **推送定制** — 3 时段 (09/12/18) × 3 频率 (每天/工作日/每周)
 - **自动群发现** — WebSocket 长连接，拉群即注册，无需配置 chat_id
-- **生产级可观测性** — 结构化 JSON 日志 + Prometheus 指标 + Grafana 仪表板（36 项监控指标）
+- **RAG 智能问答** — ChromaDB 向量库 + OpenAI Embedding + LLM 综合回答，支持 "GPT-5 什么时候发布" 等自然语言问答
+- **生产级可观测性** — 结构化 JSON 日志 + Prometheus 指标 + Grafana 仪表板（42 项监控指标）
 
 ## Architecture
 
@@ -38,7 +39,14 @@ FastAPI (HTTP)                WS Daemon Thread            APScheduler
               ▼            ▼            ▼
          LangGraph     LangGraph    Subscription
         NewsPushGraph  BotQueryGraph   Handler
-        (5 nodes)      (4 nodes)    (Facade → Repository)
+        (5 nodes)      (8 nodes,     (Facade → Repository)
+                        conditional
+                        routing: list
+                        + qa paths)         
+              │              │
+              ▼              ▼
+          ChromaDB       IntentRouter
+        (vector store)   (LLM classifier)
 ```
 
 ### Design Patterns
@@ -96,14 +104,18 @@ feishu-bot/
 │   ├── graph/
 │   │   ├── state.py                # PushState + QueryState TypedDict
 │   │   ├── news_push_graph.py      # 5-node pipeline + conditional edges
-│   │   ├── bot_query_graph.py      # 4-node interactive pipeline
-│   │   └── nodes/                  # 10 node implementations
+│   │   ├── bot_query_graph.py      # conditional routing: list + qa paths (8 nodes)
+│   │   └── nodes/                  # 13 node implementations
 │   ├── llm/
 │   │   └── provider.py             # Factory: OpenAI / Anthropic / DeepSeek
+│   ├── rag/                        # RAG 模块 (向量检索 + 问答)
+│   │   ├── embedder.py             # OpenAI text-embedding-3-small
+│   │   └── vector_store.py         # ChromaDB PersistentClient CRUD
 │   ├── prompts/
 │   │   ├── loader.py               # YAML prompt loader
 │   │   ├── intent.yaml
-│   │   └── summarize.yaml
+│   │   ├── summarize.yaml
+│   │   └── rag_answer.yaml         # RAG 问答 prompt
 │   ├── subscription/
 │   │   └── handler.py              # Facade: commands + CRUD delegation
 │   ├── chat/
@@ -111,15 +123,17 @@ feishu-bot/
 │   └── scheduler/
 │       └── jobs.py
 ├── docs/
-│   ├── adr/                        # Architecture Decision Records (6)
+│   ├── adr/                        # Architecture Decision Records (8)
 │   │   ├── 0001-websocket-over-webhook.md
 │   │   ├── 0002-two-phase-pipeline.md
 │   │   ├── 0003-ws-daemon-thread.md
 │   │   ├── 0004-langgraph-workflow.md
 │   │   ├── 0005-soft-delete-subscriptions.md
-│   │   └── 0006-thread-pool-over-asyncio.md
+│   │   ├── 0006-thread-pool-over-asyncio.md
+│   │   ├── 0007-observability-stack.md
+│   │   └── 0008-rag-upgrade.md
 │   └── concurrency-model.md        # Thread model + bottleneck analysis
-├── tests/                          # 12 test files, 165 tests
+├── tests/                          # 17 test files, 247 tests
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -184,7 +198,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ## Testing
 
 ```bash
-pytest -v          # ~190 tests across 15 test files
+pytest -v          # 247 tests across 17 test files
 ```
 
 ## License

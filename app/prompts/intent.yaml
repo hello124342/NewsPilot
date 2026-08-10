@@ -14,7 +14,11 @@ template: |
   返回格式（仅返回 JSON）：
   {{"vendor": "厂商名或null", "days": 数字}}
 
+  days 含义：回溯的日历天数（含今天）
   示例：
-  - "OpenAI 最近有什么新闻" -> {{"vendor": "OpenAI", "days": 7}}
+  - "今天有哪些新闻" -> {{"vendor": null, "days": 1}}
+  - "昨天有哪些新闻" -> {{"vendor": null, "days": 1}}
   - "最近3天 DeepSeek 的动态" -> {{"vendor": "DeepSeek", "days": 3}}
+  - "最近一周有什么新消息" -> {{"vendor": null, "days": 7}}
+  - "OpenAI 最近有什么新闻" -> {{"vendor": "OpenAI", "days": 7}}
   - "有什么新消息" -> {{"vendor": null, "days": 3}}
