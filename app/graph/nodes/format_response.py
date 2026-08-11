@@ -1,110 +1,108 @@
 """FormatResponseNode: 查询结果格式化节点
 
-将 MySQL 查询结果格式化为飞书 Interactive Card，
+将 MySQL 查询结果格式化为平台无关的 RichMessage，
 支持多篇文章列表展示和空结果处理。
+同时保留 reply_card_json 用于向后兼容飞书格式。
 """
 import logging
 from app.graph.state import QueryState
+from app.platforms.message_model import RichMessage, ActionButton
 
 logger = logging.getLogger(__name__)
 
 
-def _build_result_card(results: list[dict], intent: dict) -> dict:
-    """将查询结果构建为飞书卡片（多文章列表）
+def _build_rich_message(results: list[dict], intent: dict) -> RichMessage:
+    """将查询结果构建为平台无关的 RichMessage
 
     Args:
         results: 文章列表，每项含 title, vendor, published_at, url, summary_points
         intent: 查询意图 {"vendor": str|None, "days": int}
 
     Returns:
-        飞书卡片 JSON dict
+        RichMessage（Markdown 正文 + 阅读原文按钮）
     """
     vendor_name = intent.get("vendor") or "所有厂商"
     days = intent.get("days") or 3
 
-    # 卡片标题
-    header_title = f"🔍 {vendor_name} · 近{days}天"
     if not results:
-        return {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": "blue",
-                "title": {"tag": "plain_text", "content": header_title},
-            },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": "😕 **未找到相关新闻**\n\n可尝试扩大搜索范围或稍后再试。"},
-                }
-            ],
-        }
+        return RichMessage(
+            title=f"🔍 {vendor_name} · 近{days}天",
+            body="😕 **未找到相关新闻**\n\n可尝试扩大搜索范围或稍后再试。",
+            color_hint="info",
+        )
 
-    elements = []
-    for i, article in enumerate(results):
-        # 文章标题 + 厂商
-        title_block = f"**{article['title']}**"
-        meta_block = f"🏷️ {article['vendor']} · 📅 {article['published_at']}"
+    # 构建文章列表 Markdown
+    lines = []
+    for article in results:
+        lines.append(f"**{article['title']}**")
+        lines.append(f"🏷️ {article['vendor']} · 📅 {article['published_at']}")
 
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": title_block},
-        })
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": meta_block},
-        })
-
-        # 摘要要点（如果有）
         points = article.get("summary_points", [])
         if points and points[0]:
-            points_md = "\n".join(f"  • {p}" for p in points[:3] if p)
-            elements.append({
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": points_md},
-            })
+            for p in points[:3]:
+                if p:
+                    lines.append(f"  • {p}")
 
-        # 阅读原文按钮
-        if article.get("url"):
-            elements.append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "📖 阅读原文"},
-                    "type": "default",
-                    "url": article["url"],
-                }],
-            })
+        lines.append("")  # 文章间空行
 
-        # 文章间分隔线（非最后一篇）
-        if i < len(results) - 1:
-            elements.append({"tag": "hr"})
+    body = "\n".join(lines)
+    title = f"🔍 {vendor_name} · 近{days}天  ({len(results)} 篇)"
 
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "blue",
-            "title": {"tag": "plain_text", "content": f"{header_title}  ({len(results)} 篇)"},
-        },
-        "elements": elements,
-    }
-    return card
+    # 构建按钮：第一篇的「阅读原文」
+    buttons = []
+    first_url = results[0].get("url") if results else ""
+    if first_url:
+        buttons.append(ActionButton(
+            label="📖 阅读原文",
+            action="url",
+            value=first_url,
+            style="primary",
+        ))
+
+    return RichMessage(
+        title=title,
+        body=body,
+        buttons=buttons,
+        color_hint="info",
+        footer="💡 发送「帮助」查看更多使用方式",
+    )
+
+
+def _build_result_card_legacy(results: list[dict], intent: dict) -> dict:
+    """[过渡期] 构建飞书特定格式卡片（保持向后兼容）"""
+    from app.platforms.feishu.renderer import render_card
+    return render_card(_build_rich_message(results, intent))
 
 
 def format_response_node(state: QueryState) -> QueryState:
-    """将 query_results 格式化为飞书回复卡片
+    """将 query_results 格式化为 RichMessage + 飞书卡片
 
-    写入 reply_card_json 到 state。
+    写入 rich_message 和 reply_card_json 到 state。
     """
     results = state.get("query_results", [])
     intent = state.get("parsed_intent", {})
 
     try:
-        card = _build_result_card(results, intent)
-        state["reply_card_json"] = card
-        logger.info(f"Response card built: {len(results)} articles")
+        msg = _build_rich_message(results, intent)
+        state["reply_card_json"] = _build_result_card_legacy(results, intent)
+        state["rich_message"] = {
+            "title": msg.title,
+            "body": msg.body,
+            "buttons": [
+                {"label": b.label, "action": b.action, "value": b.value, "style": b.style}
+                for b in msg.buttons
+            ],
+            "color_hint": msg.color_hint,
+            "footer": msg.footer,
+        }
+        logger.info(f"Response built: {len(results)} articles")
     except Exception as e:
         logger.error(f"format_response_node failed: {e}")
-        # 始终构建一张兜底卡片
-        state["reply_card_json"] = _build_result_card([], intent)
+        msg = _build_rich_message([], intent)
+        state["reply_card_json"] = _build_result_card_legacy([], intent)
+        state["rich_message"] = {
+            "title": msg.title, "body": msg.body,
+            "buttons": [], "color_hint": msg.color_hint, "footer": msg.footer,
+        }
 
     return state

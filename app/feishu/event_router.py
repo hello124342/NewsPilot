@@ -213,6 +213,7 @@ def handle_message(
     from app.graph.bot_query_graph import build_query_graph
 
     state: QueryState = {
+        "platform": "feishu",
         "user_id": sender_id,
         "chat_id": chat_id,
         "user_query": query_text,

@@ -27,12 +27,14 @@ class QueryState(TypedDict, total=False):
 
     @Bot 消息触发的查询链路数据载体。
     """
-    user_id: str          # 触发用户 ID
-    chat_id: str          # 群聊 / 单聊 ID
-    user_query: str       # 用户输入的原始文本
-    query_type: str       # 意图分类: "list" | "qa"
-    parsed_intent: dict   # LLM 解析出的查询条件 {"vendor": str, "days": int}
+    platform: str          # 平台标识: "feishu" | "telegram"
+    user_id: str           # 触发用户 ID
+    chat_id: str           # 群聊 / 单聊 ID
+    user_query: str        # 用户输入的原始文本
+    query_type: str        # 意图分类: "list" | "qa"
+    parsed_intent: dict    # LLM 解析出的查询条件 {"vendor": str, "days": int}
     query_results: list[dict]  # 数据库查询结果（list 路径使用）
     rag_context: list[dict]    # RAG 检索到的文章上下文（qa 路径使用）
     rag_answer: dict           # RAG 答案 {"answer_text": str, "sources": list[dict]}
-    reply_card_json: dict      # 回复卡片 JSON
+    reply_card_json: dict      # [过渡期] 回复卡片 JSON（飞书特定格式，逐步迁移到 rich_message）
+    rich_message: dict         # 平台无关的 RichMessage（序列化为 dict）

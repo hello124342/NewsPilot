@@ -195,7 +195,7 @@ class TestNewsPushGraphIntegration:
 class TestBotQueryGraphIntegration:
     """BotQueryGraph 完整流水线集成测试"""
 
-    @patch("app.graph.nodes.reply_feishu.FeishuClient")
+    @patch("app.feishu.client.FeishuClient")
     @patch("app.graph.nodes.search_db.SessionLocal")
     @patch("app.graph.nodes.intent.get_llm")
     def test_full_query_pipeline_with_results(

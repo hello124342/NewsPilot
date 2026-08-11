@@ -231,8 +231,10 @@ class TestSubscriptionCRUD:
 
         sub1 = MagicMock()
         sub1.chat_id = "chat_001"
+        sub1.conversation_id = ""
         sub2 = MagicMock()
         sub2.chat_id = "chat_002"
+        sub2.conversation_id = ""
 
         mock_db = MagicMock()
         mock_db.query().filter_by().all.return_value = [sub1, sub2]

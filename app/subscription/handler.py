@@ -136,33 +136,39 @@ def is_today_in_frequency(frequency: str) -> bool:
 
 # ========== Facade：数据访问委托给 Repository ==========
 
-def subscribe(chat_id: str, vendor: str, db: Session | None = None) -> str:
-    return get_subscription_repo().subscribe(chat_id, vendor, db)
+def subscribe(chat_id: str, vendor: str, db: Session | None = None,
+              platform: str = "feishu") -> str:
+    return get_subscription_repo().subscribe(chat_id, vendor, db, platform=platform)
 
 
-def unsubscribe(chat_id: str, vendor: str, db: Session | None = None) -> str:
-    return get_subscription_repo().unsubscribe(chat_id, vendor, db)
+def unsubscribe(chat_id: str, vendor: str, db: Session | None = None,
+                platform: str = "feishu") -> str:
+    return get_subscription_repo().unsubscribe(chat_id, vendor, db, platform=platform)
 
 
-def list_subscriptions(chat_id: str, db: Session | None = None) -> list[str]:
-    return get_subscription_repo().list_active(chat_id, db)
+def list_subscriptions(chat_id: str, db: Session | None = None,
+                       platform: str = "feishu") -> list[str]:
+    return get_subscription_repo().list_active(chat_id, db, platform=platform)
 
 
-def get_subscribers(vendor: str) -> list[str]:
-    return get_subscription_repo().get_subscribers(vendor)
+def get_subscribers(vendor: str, platform: str = "feishu") -> list[str]:
+    return get_subscription_repo().get_subscribers(vendor, platform=platform)
 
 
-def has_any_subscription(chat_id: str) -> bool:
-    return get_subscription_repo().has_any(chat_id)
+def has_any_subscription(chat_id: str, platform: str = "feishu") -> bool:
+    return get_subscription_repo().has_any(chat_id, platform=platform)
 
 
-def get_preference(chat_id: str, db: Session | None = None) -> dict:
-    return get_subscription_repo().get_preference(chat_id, db)
+def get_preference(chat_id: str, db: Session | None = None,
+                   platform: str = "feishu") -> dict:
+    return get_subscription_repo().get_preference(chat_id, db, platform=platform)
 
 
-def set_push_time(chat_id: str, push_time: str, db: Session | None = None) -> dict:
-    return get_subscription_repo().set_push_time(chat_id, push_time, db)
+def set_push_time(chat_id: str, push_time: str, db: Session | None = None,
+                  platform: str = "feishu") -> dict:
+    return get_subscription_repo().set_push_time(chat_id, push_time, db, platform=platform)
 
 
-def set_frequency(chat_id: str, frequency: str, db: Session | None = None) -> dict:
-    return get_subscription_repo().set_frequency(chat_id, frequency, db)
+def set_frequency(chat_id: str, frequency: str, db: Session | None = None,
+                  platform: str = "feishu") -> dict:
+    return get_subscription_repo().set_frequency(chat_id, frequency, db, platform=platform)

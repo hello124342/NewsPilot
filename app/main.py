@@ -1,11 +1,12 @@
 """FastAPI 主入口
 
-飞书事件通过 WebSocket 长连接接收（lark-oapi SDK），FastAPI 仅保留
-健康检查、管理接口和 APScheduler 调度任务。
+多平台支持：飞书（WebSocket 长连接）+ Telegram（Webhook）。
+FastAPI 提供健康检查、Prometheus 指标、管理接口和 APScheduler 调度任务。
 
 架构：
 - WebSocket 长连接（daemon 线程）→ app/feishu/event_router.py → 业务逻辑
-- FastAPI → /health, /admin/trigger-rss
+- Telegram Webhook → app/platforms/telegram/webhook.py → 业务逻辑
+- FastAPI → /health, /metrics, /admin/*
 - APScheduler → 5:00 抓取存储 + 9:00/12:00/18:00 投递
 """
 import logging
@@ -110,6 +111,56 @@ async def lifespan(app: FastAPI):
     _app_services["circuit_breaker"] = feishu_cb
     _app_services["ws_thread"] = ws_thread
     logger.info(f"Feishu WS long connection started (thread: {ws_thread.name})")
+
+    # --- 注册 Telegram Webhook（如果已配置） ---
+    if settings.telegram_configured:
+        from app.platforms.telegram.webhook import configure_webhook, telegram_router
+
+        def _on_telegram_message(incoming):
+            """Telegram 消息回调：自动注册 + 命令分派 + NL 查询"""
+            from app.graph.bot_query_graph import build_query_graph
+            incoming_text = incoming.text
+
+            # 自动检测 chat 类型并注册（首次消息时）
+            _auto_detect_and_register_telegram_chat(incoming.chat_id)
+
+            # 先检查是否是订阅命令
+            from app.subscription.handler import detect_command
+            cmd = detect_command(incoming_text)
+            if cmd:
+                _handle_telegram_command(cmd, incoming.chat_id, incoming.sender_id)
+                return
+
+            # NL 查询 → BotQueryGraph
+            state = {
+                "platform": "telegram",
+                "user_id": incoming.sender_id,
+                "chat_id": incoming.chat_id,
+                "user_query": incoming_text,
+            }
+            try:
+                graph = build_query_graph()
+                graph.invoke(state)
+                logger.debug(f"Telegram query processed: chat_id={incoming.chat_id}")
+            except Exception as e:
+                logger.error(f"Telegram query failed: {e}")
+
+        def _on_telegram_callback(callback_data, chat_id, sender_id):
+            """Telegram 按钮回调：转发到订阅管理"""
+            _handle_telegram_callback_action(callback_data, chat_id, sender_id)
+
+        configure_webhook(
+            settings=settings,
+            on_message=_on_telegram_message,
+            on_callback=_on_telegram_callback,
+        )
+        # 注册 webhook 路由
+        app.include_router(telegram_router)
+        logger.info(
+            f"Telegram webhook configured at {settings.TELEGRAM_WEBHOOK_PATH}"
+        )
+    else:
+        logger.info("Telegram not configured (TELEGRAM_BOT_TOKEN is empty), skipping")
 
     yield
     scheduler.shutdown()
@@ -414,45 +465,363 @@ def process_rss_job() -> dict:
     return {"status": "ok", "processed": processed_count}
 
 
+def _handle_telegram_command(cmd: tuple, chat_id: str, sender_id: str) -> None:
+    """处理 Telegram 订阅命令（含权限校验）
+
+    Args:
+        cmd: detect_command 返回的 (action, vendor) 元组
+        chat_id: Telegram chat_id
+        sender_id: Telegram user_id
+    """
+    action, vendor = cmd
+    logger.info(f"Telegram command: {action} {vendor}, chat_id={chat_id}, sender={sender_id}")
+
+    from app.platforms.registry import get_platform_adapter
+    from app.platforms.message_model import RichMessage
+    from app.platforms.telegram.commands import (
+        resolve_vendor, build_welcome_message, build_help_message,
+    )
+
+    settings = Settings()  # type: ignore[call-arg]
+    adapter = get_platform_adapter("telegram", settings)
+    if adapter is None:
+        logger.warning("Telegram adapter not available")
+        return
+
+    PLATFORM = "telegram"
+
+    # 权限检查：modify 操作仅管理员/群主可执行
+    _modify_actions = {"subscribe", "unsubscribe", "set_time", "set_freq", "settings"}
+    if action in _modify_actions:
+        from app.chat.lifecycle import can_manage_subscription
+        if not can_manage_subscription(
+            chat_id, sender_id, platform=PLATFORM, platform_adapter=adapter
+        ):
+            try:
+                adapter.send_message(chat_id, RichMessage(
+                    title="⛔ 权限不足",
+                    body="只有**群管理员**可以修改本群的订阅设置。\n\n发送 /list 查看当前订阅状态。",
+                    color_hint="warning",
+                ))
+            except Exception:
+                pass
+            return
+
+    try:
+        if action == "subscribe":
+            from app.subscription.handler import subscribe, __ALL__
+            resolved = __ALL__ if vendor == __ALL__ else resolve_vendor(vendor)
+            if resolved is None:
+                adapter.send_message(chat_id, RichMessage(
+                    body=f"❓ 未知厂商: {vendor}。\n可用: OpenAI, Anthropic, Google DeepMind, DeepSeek, Kimi (Moonshot), Z.ai / 智谱\n或 /subscribe all 订阅全部。",
+                    color_hint="warning",
+                ))
+                return
+            # 确保 chat 已注册
+            _ensure_chat_registered(chat_id, "group", PLATFORM)
+            subscribe(chat_id, resolved, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"✅ 已订阅 **{resolved}**\n\n发送 /list 查看订阅列表。",
+                color_hint="success",
+            ))
+
+        elif action == "unsubscribe":
+            from app.subscription.handler import unsubscribe, __ALL__
+            resolved = __ALL__ if vendor == __ALL__ else resolve_vendor(vendor)
+            if resolved is None:
+                adapter.send_message(chat_id, RichMessage(
+                    body=f"❓ 未知厂商: {vendor}",
+                    color_hint="warning",
+                ))
+                return
+            _ensure_chat_registered(chat_id, "group", PLATFORM)
+            unsubscribe(chat_id, resolved, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"🔕 已退订 **{resolved}**\n\n发送 /list 查看订阅列表。",
+                color_hint="info",
+            ))
+
+        elif action == "list":
+            from app.subscription.handler import list_subscriptions
+            subs = list_subscriptions(chat_id, platform=PLATFORM)
+            if subs:
+                lines = "\n".join(f"  • {v}" for v in subs)
+                body = f"📋 **当前订阅了 {len(subs)} 个厂商：**\n\n{lines}"
+            else:
+                body = "⚠️ 尚未订阅任何厂商。\n发送 /subscribe OpenAI 开始订阅。"
+            adapter.send_message(chat_id, RichMessage(
+                title="📋 我的订阅", body=body, color_hint="info",
+            ))
+
+        elif action == "settings":
+            from app.subscription.handler import get_preference, PUSH_TIMES, FREQUENCIES
+            pref = get_preference(chat_id, platform=PLATFORM)
+            body = (
+                f"⏰ **推送时间：** {PUSH_TIMES.get(pref['push_time'], pref['push_time'])}\n"
+                f"📅 **推送频率：** {FREQUENCIES.get(pref['frequency'], pref['frequency'])}\n\n"
+                "修改：/settime 18:00 或 /setfrequency weekdays"
+            )
+            adapter.send_message(chat_id, RichMessage(
+                title="⚙️ 推送设置", body=body, color_hint="info",
+            ))
+
+        elif action == "set_time":
+            from app.subscription.handler import set_push_time
+            # vendor param carries time value in cmd tuple
+            time_val = vendor
+            norm_time = f"{time_val}:00" if ":" not in time_val else time_val
+            if len(norm_time) == 4:
+                norm_time = f"0{norm_time}"
+            set_push_time(chat_id, norm_time, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"✅ 推送时间已设为 **{norm_time}**",
+                color_hint="success",
+            ))
+
+        elif action == "set_freq":
+            from app.subscription.handler import set_frequency
+            set_frequency(chat_id, vendor, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"✅ 推送频率已设为 **{vendor}**",
+                color_hint="success",
+            ))
+
+        elif action == "help":
+            adapter.send_message(chat_id, build_help_message())
+
+        elif action == "start":
+            _ensure_chat_registered(chat_id, "user", PLATFORM)
+            adapter.send_message(chat_id, build_welcome_message())
+
+        else:
+            adapter.send_message(chat_id, RichMessage(
+                body=f"❓ 未知命令: /{action}。发送 /help 查看可用命令。",
+                color_hint="warning",
+            ))
+    except Exception as e:
+        logger.error(f"Telegram command handler failed: {e}", exc_info=True)
+        try:
+            adapter.send_message(chat_id, RichMessage(
+                body="❌ 操作失败，请稍后再试。",
+                color_hint="warning",
+            ))
+        except Exception:
+            pass
+
+
+def _handle_telegram_callback_action(callback_data, chat_id: str, sender_id: str) -> None:
+    """处理 Telegram 按钮回调（退订、设置等，含权限校验）"""
+    from app.platforms.registry import get_platform_adapter
+    from app.platforms.message_model import RichMessage
+
+    settings = Settings()  # type: ignore[call-arg]
+    adapter = get_platform_adapter("telegram", settings)
+    if adapter is None:
+        return
+
+    PLATFORM = "telegram"
+    action = callback_data.action
+
+    # 权限检查（modify 操作仅管理员可执行）
+    _modify_actions = {"unsubscribe", "subs:manage", "settings", "set_time", "set_freq"}
+    if action in _modify_actions:
+        from app.chat.lifecycle import can_manage_subscription
+        if not can_manage_subscription(
+            chat_id, sender_id, platform=PLATFORM, platform_adapter=adapter,
+        ):
+            try:
+                adapter.send_message(chat_id, RichMessage(
+                    body="⛔ 只有**群管理员**可以修改订阅设置。",
+                    color_hint="warning",
+                ))
+            except Exception:
+                pass
+            return
+
+    try:
+        if action == "unsubscribe":
+            vendor = callback_data.params.get("vendor", "")
+            if vendor:
+                from app.subscription.handler import unsubscribe
+                unsubscribe(chat_id, vendor, platform=PLATFORM)
+                adapter.send_message(chat_id, RichMessage(
+                    body=f"🔕 已退订 **{vendor}**\n\n发送 /list 查看订阅列表。",
+                    color_hint="info",
+                ))
+
+        elif action == "subs:manage":
+            from app.subscription.handler import list_subscriptions
+            subs = list_subscriptions(chat_id, platform=PLATFORM)
+            if subs:
+                lines = "\n".join(f"  • {v}" for v in subs)
+                body = f"📋 **当前订阅了 {len(subs)} 个厂商：**\n\n{lines}"
+            else:
+                body = "⚠️ 尚未订阅任何厂商。"
+            adapter.send_message(chat_id, RichMessage(
+                title="📋 我的订阅", body=body, color_hint="info",
+            ))
+
+        elif action == "list":
+            from app.subscription.handler import list_subscriptions
+            subs = list_subscriptions(chat_id, platform=PLATFORM)
+            if subs:
+                lines = "\n".join(f"  • {v}" for v in subs)
+                body = f"📋 **当前订阅了 {len(subs)} 个厂商：**\n\n{lines}"
+            else:
+                body = "⚠️ 尚未订阅任何厂商。"
+            adapter.send_message(chat_id, RichMessage(
+                title="📋 我的订阅", body=body, color_hint="info",
+            ))
+
+        elif action == "settings":
+            from app.subscription.handler import get_preference, PUSH_TIMES, FREQUENCIES
+            pref = get_preference(chat_id, platform=PLATFORM)
+            body = (
+                f"⏰ **推送时间：** {PUSH_TIMES.get(pref['push_time'], pref['push_time'])}\n"
+                f"📅 **推送频率：** {FREQUENCIES.get(pref['frequency'], pref['frequency'])}\n\n"
+                "修改：/settime 18:00 或 /setfrequency weekdays"
+            )
+            adapter.send_message(chat_id, RichMessage(
+                title="⚙️ 推送设置", body=body, color_hint="info",
+            ))
+
+        elif action == "set_time":
+            time_val = callback_data.params.get("time", "09:00")
+            from app.subscription.handler import set_push_time
+            set_push_time(chat_id, time_val, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"✅ 推送时间已设为 **{time_val}**",
+                color_hint="success",
+            ))
+
+        elif action == "set_freq":
+            freq = callback_data.params.get("freq", "daily")
+            from app.subscription.handler import set_frequency
+            set_frequency(chat_id, freq, platform=PLATFORM)
+            adapter.send_message(chat_id, RichMessage(
+                body=f"✅ 推送频率已设为 **{freq}**",
+                color_hint="success",
+            ))
+
+        else:
+            logger.debug(f"Unhandled Telegram callback action: {action}, params={callback_data.params}")
+    except Exception as e:
+        logger.error(f"Telegram callback handler failed: {e}", exc_info=True)
+        try:
+            adapter.send_message(chat_id, RichMessage(
+                body="❌ 操作失败，请稍后再试。",
+                color_hint="warning",
+            ))
+        except Exception:
+            pass
+
+
+def _auto_detect_and_register_telegram_chat(chat_id: str) -> None:
+    """自动检测 Telegram chat 类型并注册（首次消息时触发）
+
+    Telegram chat_id 规则：负数 = 群聊，正数 = 私聊
+    """
+    from app.chat.lifecycle import is_new_chat, register_chat
+    from app.subscription.handler import subscribe, ALL_VENDORS
+
+    if not is_new_chat(chat_id, platform="telegram"):
+        return
+
+    # 根据 chat_id 符号判断：私聊 ID 为正整数，群聊 ID 为负整数
+    try:
+        cid = int(chat_id)
+        is_group = cid < 0
+    except (ValueError, TypeError):
+        is_group = len(chat_id) > 15  # fallback: 长 ID 大概率是群
+
+    chat_type = "group" if is_group else "user"
+    register_chat(chat_id, chat_type=chat_type, platform="telegram")
+    logger.info(f"Telegram chat auto-registered: {chat_id} ({chat_type})")
+
+    if is_group:
+        for v in ALL_VENDORS:
+            subscribe(chat_id, v, platform="telegram")
+        logger.info(f"Telegram group auto-subscribed all vendors: {chat_id}")
+
+
+def _ensure_chat_registered(chat_id: str, chat_type: str, platform: str) -> None:
+    """确保 chat 已在 chat_registry 中注册（幂等）"""
+    from app.chat.lifecycle import register_chat, is_new_chat
+    from app.subscription.handler import subscribe, ALL_VENDORS
+
+    if is_new_chat(chat_id, platform=platform):
+        is_group = chat_type == "group"
+        register_chat(chat_id, chat_type=chat_type, platform=platform)
+        logger.info(f"Chat auto-registered: {platform}/{chat_id} ({chat_type})")
+        # 群聊自动订阅全部厂商
+        if is_group:
+            for v in ALL_VENDORS:
+                subscribe(chat_id, v, platform=platform)
+            logger.info(f"Group auto-subscribed all vendors: {platform}/{chat_id}")
+
+
 def schedule_rss_polling():
     """调度器回调入口（仅抓取+存储，不推送）"""
     return process_rss_job()
 
 
 def deliver_job(push_time: str, limit: int = 0) -> dict:
-    """按用户偏好推送今日已存储的文章
+    """按用户偏好推送今日已存储的文章（多平台）
 
     Args:
         push_time: 当前推送时间窗口（"09:00" / "12:00" / "18:00"）
+        limit: 最多推送 N 篇（0=全部）
 
     逻辑：
     1. 查询今日存储的所有文章
-    2. 对每篇文章，按 推送时间 → 频率 → 订阅 三层过滤后推送
+    2. 查询所有平台活跃 chat（含 platform 信息）
+    3. 对每篇文章，按 推送时间 → 频率 → 订阅 三层过滤后推送
+    4. 根据 chat 所属平台使用对应 Adapter 发送
     """
     import time as _time
     from datetime import date, datetime, timezone
     from app.db.database import SessionLocal
-    from app.db.models import NewsArticle
+    from app.db.models import NewsArticle, ChatRegistry, Subscription
     from app.subscription.handler import (
         get_preference, get_subscribers, has_any_subscription,
         is_today_in_frequency,
     )
-    from app.feishu.card_builder import build_news_card
-    from app.feishu.client import FeishuClient
-    from app.chat.lifecycle import get_active_chat_ids
+    from app.platforms.message_model import RichMessage, ActionButton
+    from app.platforms.registry import get_platform_adapter
     from app.core.metrics import deliver_cards_sent_total, deliver_errors_total, deliver_job_duration_seconds
 
     start_time = _time.perf_counter()
     settings = Settings()  # type: ignore[call-arg]
 
-    chat_ids = get_active_chat_ids()
-    if not chat_ids:
+    # 查询各平台活跃 chat
+    db = SessionLocal()
+    try:
+        active_chats = (
+            db.query(ChatRegistry)
+            .filter(ChatRegistry.is_active == True)
+            .all()
+        )
+        # 按平台分组：{platform: [chat_id, ...]}
+        platform_chats: dict[str, list[tuple[str, str]]] = {}
+        for chat in active_chats:
+            conv_id = chat.conversation_id or chat.chat_id
+            platform = chat.platform or "feishu"
+            platform_chats.setdefault(platform, []).append(conv_id)
+    except Exception as e:
+        logger.error(f"deliver_job query failed: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
+
+    total_chats = sum(len(c) for c in platform_chats.values())
+    if total_chats == 0:
         logger.info(f"deliver_job({push_time}): no active chats")
         deliver_job_duration_seconds.labels(push_time=push_time).observe(_time.perf_counter() - start_time)
         return {"status": "ok", "delivered": 0}
-    logger.info(f"deliver_job({push_time}): targeting {len(chat_ids)} active chat(s)")
-
-    feishu = FeishuClient(settings)
+    logger.info(
+        f"deliver_job({push_time}): targeting {total_chats} active chat(s) "
+        f"across {list(platform_chats.keys())}"
+    )
 
     # 查询今日文章
     db = SessionLocal()
@@ -465,7 +834,7 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
             .all()
         )
     except Exception as e:
-        logger.error(f"deliver_job query failed: {e}")
+        logger.error(f"deliver_job article query failed: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
@@ -478,44 +847,76 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
     delivered = 0
     for article in articles:
         vendor = article.vendor
+        points = (article.summary_points or "").split("\n") if article.summary_points else []
 
-        for chat_id in chat_ids:
-            # 过滤 1: 推送时间匹配
-            pref = get_preference(chat_id)
-            if pref["push_time"] != push_time:
+        for platform, chat_list in platform_chats.items():
+            adapter = get_platform_adapter(platform, settings)
+            if adapter is None:
+                logger.warning(f"deliver_job: platform '{platform}' adapter not available, skipping {len(chat_list)} chats")
                 continue
 
-            # 过滤 2: 频率匹配
-            if not is_today_in_frequency(pref["frequency"]):
-                continue
-
-            # 过滤 3: 订阅匹配
-            if has_any_subscription(chat_id):
-                subscribers = set(get_subscribers(vendor))
-                if chat_id not in subscribers:
+            for chat_id in chat_list:
+                # 过滤 1: 推送时间匹配
+                pref = get_preference(chat_id, platform=platform)
+                if pref["push_time"] != push_time:
                     continue
 
-            # 发送
-            try:
-                points = (article.summary_points or "").split("\n") if article.summary_points else []
-                card = build_news_card(
-                    title=article.title,
-                    vendor=article.vendor,
-                    summary_points=points,
-                    raw_url=article.url,
-                    published_at=article.published_at.strftime("%Y-%m-%d") if article.published_at else "",
-                )
-                feishu.send_card(chat_id, card)
-                delivered += 1
-                deliver_cards_sent_total.labels(push_time=push_time).inc()
-            except Exception as e:
-                logger.warning(f"deliver_job send failed for {article.url} to {chat_id}: {e}")
-                deliver_errors_total.labels(push_time=push_time).inc()
+                # 过滤 2: 频率匹配
+                if not is_today_in_frequency(pref["frequency"]):
+                    continue
+
+                # 过滤 3: 订阅匹配
+                if has_any_subscription(chat_id, platform=platform):
+                    subscribers = set(get_subscribers(vendor, platform=platform))
+                    if chat_id not in subscribers:
+                        continue
+
+                # 发送（平台感知）
+                try:
+                    pub_date = article.published_at.strftime("%Y-%m-%d") if article.published_at else ""
+
+                    # 构建 RichMessage（平台无关）
+                    points_md = "\n".join(f"  {i}. {p}" for i, p in enumerate(points, 1)) if points else "暂无摘要"
+                    body = (
+                        f"📰 **{article.title}**\n\n"
+                        f"💡 **核心要点总结**\n{points_md}"
+                    )
+
+                    msg = RichMessage(
+                        title=vendor,
+                        body=body,
+                        buttons=[
+                            ActionButton(label="📖 阅读原文", action="url", value=article.url or "", style="primary"),
+                            ActionButton(
+                                label=f"🔕 退订 {vendor}",
+                                action="callback",
+                                value=f'{{"action":"unsubscribe","vendor":"{vendor}"}}',
+                                style="default",
+                            ),
+                        ],
+                        color_hint="info",
+                        footer=f"📅 {pub_date}",
+                    )
+
+                    adapter.send_message(chat_id, msg)
+                    delivered += 1
+                    deliver_cards_sent_total.labels(push_time=push_time).inc()
+                except Exception as e:
+                    logger.warning(
+                        f"deliver_job send failed for {article.url} to {platform}/{chat_id}: {e}"
+                    )
+                    deliver_errors_total.labels(push_time=push_time).inc()
+
+                if limit and delivered >= limit:
+                    break
 
             if limit and delivered >= limit:
                 break
 
+        if limit and delivered >= limit:
+            break
+
     elapsed = _time.perf_counter() - start_time
     deliver_job_duration_seconds.labels(push_time=push_time).observe(elapsed)
-    logger.info(f"deliver_job({push_time}): {delivered} cards sent, {len(articles)} articles, limit={limit}")
+    logger.info(f"deliver_job({push_time}): {delivered} cards sent across {len(platform_chats)} platform(s)")
     return {"status": "ok", "delivered": delivered}
