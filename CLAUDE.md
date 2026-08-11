@@ -4,21 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes Interactive Cards to Feishu (Lark). Supports @Bot queries from within Feishu groups, with RAG-powered semantic search and AI-assisted Q&A.
+Feishu AI News Bot — a FastAPI + LangGraph multi-platform service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes rich messages to **Feishu (Lark)** and **Telegram**. Supports @Bot queries from within chat groups, with RAG-powered semantic search and AI-assisted Q&A.
 
-**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Dynamic chat discovery via Feishu WebSocket long connection (no hardcoded chat IDs). Per-chat vendor subscriptions with push time & frequency customization. Group owner permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek). RAG intelligent Q&A — semantic search (ChromaDB + OpenAI embeddings) with LLM-generated answers with citations. Intent routing: auto-classifies queries as "list search" vs "natural language Q&A".
+**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Multi-platform delivery (Feishu Interactive Cards + Telegram Markdown/InlineKeyboard). Dynamic chat discovery via Feishu WebSocket + Telegram Webhook. Per-chat vendor subscriptions with push time & frequency customization. Group owner/admin permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek). RAG intelligent Q&A — semantic search (ChromaDB + OpenAI embeddings) with LLM-generated answers with citations. Intent routing: auto-classifies queries as "list search" vs "natural language Q&A".
 
-**Scheduling:** Articles are fetched and summarized at 5:00 AM daily, then delivered at 9:00 / 12:00 / 18:00 based on each chat's time preference. Multi-layer push filtering: push_time → frequency (daily/weekdays/weekly) → vendor subscription.
+**Scheduling:** Articles are fetched and summarized at 5:00 AM daily, then delivered at 9:00 / 12:00 / 18:00 based on each chat's time preference. Multi-layer push filtering: push_time → frequency (daily/weekdays/weekly) → vendor subscription. Delivery is platform-aware — each chat gets messages rendered in its native format.
 
-**Event receiving:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop. FastAPI serves `/health`, `/metrics`, and `/admin/*` endpoints.
+**Event receiving:**
+- **Feishu:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop.
+- **Telegram:** Webhook via `python-telegram-bot` — FastAPI route at `/webhook/telegram` receives Update objects. `my_chat_member` events auto-register groups.
 
-**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (42 counters/gauges/histograms across HTTP, LLM, Feishu API, Pipeline, CircuitBreaker, WebSocket, RAG), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
+FastAPI serves `/health`, `/metrics`, `/admin/*`, and the Telegram webhook endpoint.
 
-**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, Trafilatura, feedparser, httpx, ChromaDB, OpenAI embeddings, Pytest, Docker, Prometheus, Grafana.
+**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (42 counters/gauges/histograms across HTTP, LLM, Feishu API, Telegram API, Pipeline, CircuitBreaker, WebSocket, RAG), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
+
+**Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, python-telegram-bot, Trafilatura, feedparser, httpx, ChromaDB, OpenAI embeddings, Pytest, Docker, Prometheus, Grafana.
 
 **Code style:** Comments in Chinese, variable/function/class names in English.
 
-**Design Patterns:**
+## Design Patterns
 
 | Pattern | Location | Type |
 |---------|----------|------|
@@ -26,6 +30,8 @@ Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news s
 | **Circuit Breaker** | `app/core/resilience.py` | 3-state machine (CLOSED/OPEN/HALF_OPEN) for Feishu API calls |
 | **Producer-Consumer** | `app/feishu/event_router.py` | `ThreadPoolExecutor(max_workers=5)` offloads event processing from WS thread |
 | **Factory** | `app/llm/provider.py` | `get_llm()` returns provider-specific `BaseChatModel` |
+| **Factory** | `app/platforms/registry.py` | `get_platform_adapter()` returns platform-specific `PlatformAdapter` |
+| **Adapter (Platform)** | `app/platforms/` | `PlatformAdapter` ABC → `FeishuAdapter` / `TelegramAdapter`; isolates IM platform specifics |
 | **Strategy** | `app/fetcher/` | RSS vs Kimi HTML scraper selected by `source["fetcher"]` |
 | **Builder** | `app/feishu/card_builder.py` | 7 card type builders (news, RAG answer, subscription, welcome, settings) |
 | **Observer** | `app/feishu/event_router.py` | SDK `EventDispatcherHandler` routes events to typed handlers |
@@ -34,9 +40,9 @@ Feishu AI News Bot — a FastAPI + LangGraph service that polls AI vendor news s
 | **Registry (isolated)** | `app/core/metrics.py` | `CollectorRegistry()` singleton — metrics isolated from global Prometheus registry |
 | **Strategy (intent routing)** | `app/graph/nodes/intent_router.py` | LLM classification + keyword heuristic fallback: list vs qa routing |
 
-**Concurrency Model:** 3-thread architecture — FastAPI main (uvicorn asyncio), WS daemon (isolated event loop), Event worker pool (ThreadPoolExecutor). Shared state via MySQL/Redis/TTL Cache (threading.Lock). See `docs/concurrency-model.md` for full analysis.
+**Concurrency Model:** 4-thread architecture — FastAPI main (uvicorn asyncio), Feishu WS daemon (isolated event loop), Event worker pool (ThreadPoolExecutor), Telegram webhook (FastAPI route, synchronous by default). Shared state via MySQL/Redis/TTL Cache (threading.Lock). See `docs/concurrency-model.md` for full analysis.
 
-**Architecture Decisions:** 8 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, observability stack, and RAG upgrade.
+**Architecture Decisions:** 9 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, observability stack, RAG upgrade, and multi-platform adapter.
 
 **Database Migrations:** Lightweight auto-migration in `app/db/database.py:_run_migrations()` — detects missing columns on startup and applies ALTER TABLE. Safe, idempotent, no external migration framework needed.
 
@@ -58,20 +64,81 @@ pytest -v
 
 ## Architecture
 
+### Multi-Platform Adapter Pattern
+
+```
+                    ┌──────────────────────────────┐
+                    │     Core Business Logic       │
+                    │  (subscription, graph, chat)  │
+                    └──────────────┬───────────────┘
+                                   │  uses
+                    ┌──────────────▼───────────────┐
+                    │     PlatformAdapter (ABC)     │
+                    │   app/platforms/adapter.py    │
+                    ├──────────────────────────────┤
+                    │ + send_message(target, msg)   │
+                    │ + get_conversation_info(id)   │
+                    │ + get_platform_name()         │
+                    └──────────────┬───────────────┘
+                                   │  implements
+                    ┌──────────────┼───────────────┐
+                    │              │               │
+              ┌─────▼─────┐ ┌──────▼──────┐
+              │  Feishu   │ │  Telegram   │  (Slack, Discord...)
+              │  Adapter  │ │  Adapter    │
+              └───────────┘ └─────────────┘
+```
+
+Core business logic operates on `RichMessage` (platform-agnostic). Each adapter renders it:
+- **Feishu:** `RichMessage` → Interactive Card JSON (lark_md elements + action buttons)
+- **Telegram:** `RichMessage` → HTML text + InlineKeyboardMarkup
+
+The pattern mirrors the existing LLM Provider Factory (`app/llm/provider.py`).
+
+### Platform Module Structure
+
+```
+app/platforms/
+├── adapter.py                # PlatformAdapter ABC (5 abstract methods)
+├── message_model.py          # RichMessage, ActionButton, CallbackData, ConversationInfo, IncomingMessage
+├── registry.py               # Platform registration + discovery (get_platform_adapter, list_available_platforms)
+├── feishu/
+│   ├── adapter.py            # FeishuAdapter — wraps existing FeishuClient
+│   └── renderer.py           # RichMessage → Feishu Interactive Card JSON
+└── telegram/
+    ├── adapter.py            # TelegramAdapter — python-telegram-bot Bot instance
+    ├── renderer.py           # RichMessage → HTML + InlineKeyboardMarkup
+    ├── webhook.py            # FastAPI webhook endpoint (/webhook/telegram)
+    └── commands.py           # Command templates + vendor alias resolution
+```
+
+### Data Model (Multi-Platform)
+
+Three tables store platform metadata alongside existing `chat_id`:
+
+```
+Subscription:   platform | conversation_id | chat_id (compat) | vendor | is_active
+ChatPreference: platform | conversation_id | chat_id (compat) | push_time | frequency
+ChatRegistry:   platform | conversation_id | chat_id (compat) | chat_type | owner_id | is_active
+```
+
+- `platform` = `"feishu"` | `"telegram"` — which IM platform
+- `conversation_id` = platform-native chat/user ID (e.g., `oc_xxx` for Feishu, `-123456` for Telegram group)
+- `chat_id` = legacy compat column, set equal to `conversation_id` for existing data
+- All repository/facade functions accept optional `platform="feishu"` parameter (backward compatible)
+
 ### Scheduling (Two-Phase Pipeline)
 
 ```
 05:00 — process_rss_job()  → fetch + summarize + store (no push)
-09:00 — deliver_job("09:00") → query today's articles → filter → send cards
-12:00 — deliver_job("12:00") → query today's articles → filter → send cards
-18:00 — deliver_job("18:00") → query today's articles → filter → send cards
+09:00 — deliver_job("09:00") → query today's articles → filter → send (multi-platform)
+12:00 — deliver_job("12:00") → query today's articles → filter → send (multi-platform)
+18:00 — deliver_job("18:00") → query today's articles → filter → send (multi-platform)
 ```
 
-The 5 AM batch uses `build_push_graph(push_enabled=False)` — it only runs extract→summarize→store, skipping card building and sending. Delivery jobs query stored articles and apply three-layer filtering: push_time preference, frequency setting, and vendor subscription.
+The 5 AM batch uses `build_push_graph(push_enabled=False)` — it only runs extract→summarize→store, skipping card building and sending. Delivery jobs query stored articles and apply three-layer filtering per-platform, per-chat: push_time preference, frequency setting, and vendor subscription.
 
-### WebSocket Event Flow
-
-Events arrive via `lark-oapi` WebSocket long connection (no HTTP webhook):
+### WebSocket Event Flow (Feishu)
 
 ```
 飞书服务器 ←→ lark.ws.Client (daemon thread, independent event loop)
@@ -85,11 +152,35 @@ Events arrive via `lark-oapi` WebSocket long connection (no HTTP webhook):
   (text + cards)   (group onboard)   (deactivate)
         │
         ├── subscription command? → _dispatch_subscription_command()
-        └── news query?          → BotQueryGraph
+        └── news query?          → BotQueryGraph (platform="feishu")
 ```
 
 - `app/feishu/ws_client.py` — daemon thread, independent `asyncio` loop (patches SDK module-level loop), auto-reconnect (exponential backoff 1s→60s)
-- `app/feishu/event_router.py` — typed SDK handlers → existing business logic, message dedup via OrderedDict cache
+- `app/feishu/event_router.py` — typed SDK handlers → existing business logic, message dedup via OrderedDict cache, `QueryState.platform = "feishu"`
+
+### Webhook Event Flow (Telegram)
+
+```
+Telegram Server → POST /webhook/telegram (FastAPI route)
+                        │
+                        ▼
+              handle_telegram_webhook()
+                        │
+        ┌───────────────┼──────────────────┐
+        ▼               ▼                  ▼
+  _handle_message  _handle_callback  _handle_my_chat_member
+  (text + cmd)     (button click)    (bot added/removed)
+        │
+        ├── /command detected? → _handle_telegram_command()
+        │   (permission check via TelegramAdapter.is_admin())
+        │   (auto-register chat on first message)
+        │
+        └── NL query? → BotQueryGraph (platform="telegram")
+```
+
+- `app/platforms/telegram/webhook.py` — FastAPI route + secret token validation + event dispatch
+- `app/platforms/telegram/commands.py` — vendor alias resolution, welcome/help message templates
+- `app/main.py` — `_handle_telegram_command()`, `_handle_telegram_callback_action()`, `_auto_detect_and_register_telegram_chat()`
 
 ### LangGraph Workflows
 
@@ -100,7 +191,7 @@ Two LangGraph workflows drive the system:
    - `extract.py` — fetches raw article content via Trafilatura
    - `summarize.py` — LLM distills 3 key points (with 3x retry)
    - `store.py` — persists to MySQL using state's `published_at` field
-   - `build_card.py` — builds Interactive Card JSON from state fields
+   - `build_card.py` — builds Feishu Interactive Card JSON from state fields
    - `send_feishu.py` — resolves dynamic targets via chat_registry + subscription filter, sends cards
    - Supports checkpointing (`enable_checkpoint`) and human-in-the-loop (`enable_human_review`)
    - Conditional edges: FAILED status routes directly to END
@@ -111,29 +202,42 @@ Two LangGraph workflows drive the system:
                 ├─ "list" → IntentNode → SearchDBNode → FormatResponseNode → ReplyFeishuNode → [End]
                 └─ "qa"   → RAGRetrieveNode → RAGAnswerNode → FormatRAGResponseNode → ReplyFeishuNode → [End]
    ```
-   - `intent_router.py` — **NEW** — LLM 3-class classification (list/qa/command) with 2x retry + keyword heuristic fallback
+   - `intent_router.py` — LLM 3-class classification (list/qa/command) with 2x retry + keyword heuristic fallback
    - `intent.py` — parses user NL into structured query (vendor via alias map, date range `_extract_days_from_query()`), LLM with 3x retry + keyword fallback
    - `search_db.py` — queries MySQL for matching articles by vendor + calendar day range (`_calc_since()` uses 00:00 UTC boundaries)
-   - `rag_retrieve.py` — **NEW** — semantic search: query embedding → ChromaDB top-K → MySQL backfill `raw_content`
-   - `rag_answer.py` — **NEW** — LLM reads context + user question → comprehensive answer with `[来源 N]` citations
-   - `format_response.py` — builds multi-article result card (or "未找到" empty card)
-   - `format_rag_response.py` — **NEW** — wraps RAG answer into `build_rag_answer_card()`
-   - `reply_feishu.py` — sends reply card to chat_id from QueryState
+   - `rag_retrieve.py` — semantic search: query embedding → ChromaDB top-K → MySQL backfill `raw_content`
+   - `rag_answer.py` — LLM reads context + user question → comprehensive answer with `[来源 N]` citations
+   - `format_response.py` — builds **platform-agnostic RichMessage** (Markdown body + ActionButtons)
+   - `format_rag_response.py` (inline in bot_query_graph.py) — wraps RAG answer into RichMessage
+   - `reply_feishu.py` — **platform-aware:** checks `state["platform"]`, renders RichMessage via adapter, falls back to legacy FeishuClient for backward compat
 
 ### Key Modules
 
 **Application Layer:**
-- `app/main.py` — FastAPI entry point, SOURCES config, APScheduler lifecycle (4 jobs), `/health`, `/metrics`, `/admin/*` endpoints
-- `app/core/config.py` — all config via `pydantic-settings` (env vars): Feishu, LLM, MySQL, Redis, `LOG_LEVEL`
+- `app/main.py` — FastAPI entry point, SOURCES config, APScheduler lifecycle (4 jobs), `/health`, `/metrics`, `/admin/*` endpoints, Telegram webhook setup + command/callback handlers
+- `app/core/config.py` — all config via `pydantic-settings` (env vars): Feishu, Telegram, LLM, MySQL, Redis, `LOG_LEVEL`
 - `app/core/logging_config.py` — structured JSON logging via `python-json-logger`, configurable `LOG_LEVEL`, suppresses noisy third-party libs
 - `app/core/metrics.py` — 36 Prometheus metrics (counters/gauges/histograms), decorator/context-manager instrumentation, isolated `CollectorRegistry`
 - `app/core/security.py` — [已废弃] Feishu webhook 签名验证，WebSocket 模式无需验签
 
+**Platform Adapter Layer:**
+- `app/platforms/adapter.py` — `PlatformAdapter` ABC: `send_message()`, `get_conversation_info()`, `get_platform_name()`, `get_platform_label()`, lifecycle hooks
+- `app/platforms/message_model.py` — `RichMessage` (title, body, buttons, color_hint, footer), `ActionButton` (label, action, value, style), `CallbackData`, `ConversationInfo`, `IncomingMessage`
+- `app/platforms/registry.py` — `get_platform_adapter(platform, settings)` factory, `list_available_platforms()`, `is_platform_configured()`
+
 **Feishu Integration:**
 - `app/feishu/client.py` — Feishu Open API via `lark-oapi` SDK, auto-managed token
 - `app/feishu/card_builder.py` — card builders: `build_news_card()` (Plan A), `build_rag_answer_card()` (RAG Q&A), `build_subscription_reply()`, `build_subscription_list_card()`, `build_welcome_card()`, `build_group_welcome_card()`, `build_settings_card()`
-- `app/feishu/event_router.py` — WebSocket event dispatcher: typed SDK handlers for messages, card actions, bot lifecycle events. Events dispatched via `ThreadPoolExecutor`. Fixed first-message bug (welcome card no longer blocks query processing)
+- `app/feishu/event_router.py` — WebSocket event dispatcher: typed SDK handlers for messages, card actions, bot lifecycle events. Events dispatched via `ThreadPoolExecutor`. Passes `platform="feishu"` in QueryState.
 - `app/feishu/ws_client.py` — WS thread manager: independent event loop, auto-reconnect with exponential backoff, daemon thread for FastAPI coexistence
+- `app/platforms/feishu/adapter.py` — `FeishuAdapter` wrapping `FeishuClient` for `PlatformAdapter` interface
+- `app/platforms/feishu/renderer.py` — `RichMessage` → Feishu Interactive Card JSON
+
+**Telegram Integration:**
+- `app/platforms/telegram/adapter.py` — `TelegramAdapter` using `python-telegram-bot` Bot instance; includes `is_admin()` for group permission checks
+- `app/platforms/telegram/renderer.py` — `RichMessage` → HTML text + InlineKeyboardMarkup; long message auto-chunking at 4000 chars
+- `app/platforms/telegram/webhook.py` — FastAPI webhook endpoint + `my_chat_member` event for group lifecycle
+- `app/platforms/telegram/commands.py` — vendor alias resolution, welcome/help message templates
 
 **RAG (Retrieval-Augmented Generation):**
 - `app/rag/embedder.py` — OpenAI `text-embedding-3-small` (1536-dim) via `openai.OpenAI` client, 3x retry, Prometheus metrics
@@ -146,23 +250,22 @@ Two LangGraph workflows drive the system:
 - `app/fetcher/web_scraper.py` — article full-text extraction via Trafilatura (3x exponential backoff)
 
 **Storage:**
-- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle` (with `raw_content` column for RAG), `Subscription`, `ChatPreference`, `ChatRegistry`
-- `app/db/database.py` — SQLAlchemy session factory + `_run_migrations()` auto-migration for missing columns
+- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle` (with `raw_content` column for RAG), `Subscription` (with `platform` + `conversation_id`), `ChatPreference` (with `platform` + `conversation_id`), `ChatRegistry` (with `platform` + `conversation_id`)
+- `app/db/database.py` — SQLAlchemy session factory + `_run_migrations()` auto-migration (12 migrations including multi-platform columns)
 - `app/db/redis.py` — URL dedup cache (Redis Set) + `tenant_access_token` cache
-- `app/db/repositories.py` — Repository ABC interfaces (`SubscriptionRepository`, `ChatRegistryRepository`)
-- `app/db/sql_repositories.py` — SQLAlchemy Repository implementations; `replace_repos()` for test injection
-- `app/core/cache.py` — Thread-safe TTL memory cache (300s). Caches chat_type, owner_id, preferences
-- `app/core/resilience.py` — Circuit Breaker (3-state: CLOSED/OPEN/HALF_OPEN). Injected into `FeishuClient`
+- `app/db/repositories.py` — Repository ABC interfaces (`SubscriptionRepository`, `ChatRegistryRepository`) with `platform` parameters
+- `app/db/sql_repositories.py` — SQLAlchemy Repository implementations; all CRUD methods platform-aware; `replace_repos()` for test injection
+- `app/core/cache.py` — Thread-safe TTL memory cache (300s). Caches chat_type, owner_id, preferences (keys now scoped by `platform:chat_id`)
 
 **LLM:**
 - `app/llm/provider.py` — Factory for multi-provider LLM (OpenAI/Anthropic/DeepSeek), returns `BaseChatModel`
 - `app/prompts/loader.py` — YAML-based prompt template loader (`intent.yaml`, `summarize.yaml`, `rag_answer.yaml`)
 
 **Subscription & Chat Management:**
-- `app/subscription/handler.py` — subscribe/unsubscribe/list commands, vendor aliases (12+ mappings), command regex detection, push time/frequency preferences. Constant: `ALL_VENDORS`, `PUSH_TIMES` (09:00/12:00/18:00), `FREQUENCIES` (daily/weekdays/weekly_monday)
-- `app/chat/lifecycle.py` — chat auto-registration on bot added, deactivation on bot removed, active chat queries, owner_id caching, permission check (`can_manage_subscription()`)
+- `app/subscription/handler.py` — subscribe/unsubscribe/list commands, vendor aliases (12+ mappings), command regex detection, push time/frequency preferences. All facade functions accept `platform` parameter (default `"feishu"`). Constant: `ALL_VENDORS`, `PUSH_TIMES` (09:00/12:00/18:00), `FREQUENCIES` (daily/weekdays/weekly_monday)
+- `app/chat/lifecycle.py` — chat auto-registration on bot added, deactivation on bot removed, active chat queries, owner_id caching, permission check (`can_manage_subscription()` now multi-platform: Feishu owner_id vs Telegram `is_admin()`)
 
-**State definitions** are in `app/graph/state.py` — `PushState` (raw_url, raw_content, vendor, title, published_at, summary_points, card_json, status) and `QueryState` (user_id, chat_id, user_query, parsed_intent, query_results, query_type, rag_context, rag_answer, reply_card_json) TypedDicts.
+**State definitions** are in `app/graph/state.py` — `PushState` (raw_url, raw_content, vendor, title, published_at, summary_points, card_json, status) and `QueryState` (platform, user_id, chat_id, user_query, parsed_intent, query_results, query_type, rag_context, rag_answer, reply_card_json, rich_message) TypedDicts.
 
 **Error handling:** 3x exponential backoff on scraping, LangGraph node-level retry for 429 Rate Limit, auto-refreshing Feishu token in Redis. URL marked processed only after successful card send (or when zero subscribers, to prevent infinite reprocessing). RAG embedding failures are logged but don't block the main news processing pipeline.
 
@@ -184,8 +287,10 @@ intent_router: ──"qa"──→ rag_retrieve               ┌─────
                             ├─ LLM reads context + question
                             ├─ _extract_sources(context)
                             ▼
-                          format_rag_response → reply_feishu
+                          format_rag_response → reply_feishu (platform-aware)
                             │
+                            ├─ Feishu: RichMessage → Interactive Card JSON
+                            ├─ Telegram: RichMessage → HTML + InlineKeyboard
                             ▼
                     ┌─────────────────────────────┐
                     │ 🤖 AI 行业情报 (green)       │
@@ -194,6 +299,34 @@ intent_router: ──"qa"──→ rag_retrieve               ┌─────
                     │ 📚 [来源1] [来源2] [来源3]    │
                     └─────────────────────────────┘
 ```
+
+### Telegram Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome message + feature guide |
+| `/subscribe OpenAI` | Subscribe to a vendor (or `/subscribe all`) |
+| `/unsubscribe DeepSeek` | Unsubscribe from a vendor |
+| `/list` | View current subscriptions |
+| `/settings` | View push time & frequency settings |
+| `/settime 18:00` | Set push time (09:00 / 12:00 / 18:00) |
+| `/setfrequency weekdays` | Set frequency (daily / weekdays / weekly_monday) |
+| `/help` | Show help message |
+
+NL queries also supported: "OpenAI 最近有什么新闻", "GPT-5 什么时候发布", etc.
+
+### Telegram Configuration
+
+```bash
+# .env
+TELEGRAM_BOT_TOKEN=your_bot_token_from_BotFather
+# Optional: webhook secret for security
+TELEGRAM_WEBHOOK_SECRET=random_secret_string
+# Optional: custom webhook path (default: /webhook/telegram)
+TELEGRAM_WEBHOOK_PATH=/webhook/telegram
+```
+
+When `TELEGRAM_BOT_TOKEN` is empty, Telegram integration silently disables — Feishu continues working normally.
 
 ## Admin Endpoints
 
@@ -219,7 +352,7 @@ SOURCES config in `app/main.py` — 10 sources across 6 vendors:
 
 Each source entry: `{vendor, channel ("Blog"|"Twitter"), url, fetcher ("rss"|"kimi"), filter (optional)}`
 
-## Card Design (Plan A)
+## Card Design (Feishu — Plan A)
 
 ```
 ┌─────────────────────────────┐
@@ -241,12 +374,21 @@ Each source entry: `{vendor, channel ("Blog"|"Twitter"), url, fetcher ("rss"|"ki
 
 Channel icons: 📰 Blog, 🐦 Twitter. Function signature: `build_news_card(title, vendor, summary_points, raw_url, published_at, channel="Blog")`
 
-Additional card types in `app/feishu/card_builder.py`:
-- **Subscription confirmations** — `build_subscription_reply(action, vendor)` for subscribe/unsubscribe feedback
-- **Subscription list** — `build_subscription_list_card(subscribed)` showing all 6 vendors with status
-- **Welcome cards** — `build_welcome_card()` (private chat) and `build_group_welcome_card()` (group onboarding)
-- **Settings panel** — `build_settings_card(subscribed, push_time, frequency)` with interactive time/freq buttons
-- **RAG Answer** — `build_rag_answer_card(answer_text, sources, original_query)` with 🤖 AI 行业情报 header (green), user question, LLM answer with citation markers, and 📚 source buttons linking to original articles
+## Message Design (Telegram)
+
+```
+🤖 OpenAI
+📰 **GPT-5 Released**
+💡 **核心要点总结**
+  1. Point one
+  2. Point two
+  3. Point three
+[📖 阅读原文] [🔕 退订 OpenAI]
+─────────────────────
+📅 2026-08-07
+```
+
+Telegram messages use HTML formatting + InlineKeyboardMarkup. Buttons: URL buttons for links, callback buttons for subscribe/unsubscribe/settings actions. Long messages auto-chunk at 4000 characters.
 
 ## Subscription System
 
@@ -254,25 +396,27 @@ Commands (Chinese + English, detected via regex in `app/subscription/handler.py`
 
 | Command | Example |
 |---------|---------|
-| Subscribe | `@Bot 订阅 OpenAI` / `subscribe Anthropic` |
-| Unsubscribe | `@Bot 退订 OpenAI` / `unsubscribe Anthropic` |
-| List | `@Bot 订阅列表` / `list subscriptions` |
-| Settings | `@Bot 设置` / `settings` |
-| Set Time | `@Bot 设置推送时间 晚上6点` / `set push time 18:00` |
-| Set Frequency | `@Bot 设置频率 仅工作日` / `set frequency weekdays` |
+| Subscribe | `@Bot 订阅 OpenAI` / `subscribe Anthropic` / `/subscribe OpenAI` |
+| Unsubscribe | `@Bot 退订 OpenAI` / `unsubscribe Anthropic` / `/unsubscribe OpenAI` |
+| List | `@Bot 订阅列表` / `list subscriptions` / `/list` |
+| Settings | `@Bot 设置` / `settings` / `/settings` |
+| Set Time | `@Bot 设置推送时间 晚上6点` / `set push time 18:00` / `/settime 18:00` |
+| Set Frequency | `@Bot 设置频率 仅工作日` / `set frequency weekdays` / `/setfrequency workdays` |
 
 **Push times:** 09:00 (早上9点), 12:00 (中午12点), 18:00 (下午6点). Default: 09:00.
 **Frequencies:** daily (每天), weekdays (仅工作日), weekly_monday (每周一汇总). Default: daily.
 
-**Permission model:** Group chats — only group owner can modify subscriptions. Private chats — user manages their own. Enforced in `app/chat/lifecycle.py:can_manage_subscription()`.
+**Permission model:** Group chats — only group owner (Feishu) or admin (Telegram) can modify subscriptions. Private chats — user manages their own. Enforced in `app/chat/lifecycle.py:can_manage_subscription()` which uses `FeishuClient.get_chat_info()` for Feishu and `TelegramAdapter.is_admin()` for Telegram.
 
-**Onboarding flow:** Bot added to group → auto-subscribe all vendors → send group welcome card. Private chat → first non-command message triggers welcome card with subscription guide.
+**Onboarding flow:**
+- **Feishu:** Bot added to group → auto-subscribe all vendors → send group welcome card. Private chat → first non-command message triggers welcome card with subscription guide.
+- **Telegram:** `my_chat_member` event (bot added to group) → auto-register + auto-subscribe all + welcome message. Private chat → first `/start` or text message → auto-register + welcome message. Chat type auto-detected from chat_id sign (negative = group).
 
 ## Development Process
 
 This project follows **TDD** per the implementation plan in `implementation-plan.md`. The plan defines 7 sequential tasks, each requiring tests written first (`tests/`), then implementation, then `pytest -v` verification.
 
-All 7 tasks are complete. RAG upgrade (+5 phases) and query accuracy bug fixes delivered. Current test suite: **247 tests passing** across 17 test files.
+All 7 tasks complete. RAG upgrade (+5 phases), query accuracy bug fixes, and multi-platform adapter (+6 phases) delivered. Current test suite: **247 tests passing** across 17 test files.
 
 ## Monitoring Stack
 

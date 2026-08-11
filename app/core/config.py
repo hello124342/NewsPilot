@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     FEISHU_APP_SECRET: str = ""
     FEISHU_CHAT_IDS: str = ""
 
+    # ========== Telegram Bot 配置 ==========
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_WEBHOOK_PATH: str = "/webhook/telegram"
+    TELEGRAM_WEBHOOK_SECRET: str = ""  # 可选，webhook 安全校验
+
     # ========== LLM 多厂商配置 ==========
     LLM_PROVIDER: Literal["openai", "anthropic", "deepseek"] = "openai"
     LLM_MODEL: str = ""  # 空字符串表示使用厂商默认模型
@@ -79,3 +84,8 @@ class Settings(BaseSettings):
     def feishu_configured(self) -> bool:
         """检查飞书凭证是否已配置"""
         return bool(self.FEISHU_APP_ID.strip() and self.FEISHU_APP_SECRET.strip())
+
+    @property
+    def telegram_configured(self) -> bool:
+        """检查 Telegram 凭证是否已配置"""
+        return bool(self.TELEGRAM_BOT_TOKEN.strip())

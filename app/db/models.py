@@ -48,7 +48,11 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(String(128), nullable=False, index=True, comment="飞书 chat_id（群聊或私聊）")
+    platform = Column(String(32), default="feishu", nullable=False, index=True,
+                      comment="平台标识：feishu / telegram")
+    conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
+    chat_id = Column(String(128), nullable=True, index=True,
+                     comment="[过渡期兼容] 飞书 chat_id，等同于 conversation_id")
     vendor = Column(String(128), nullable=False, comment="订阅的厂商名称")
     is_active = Column(Boolean, default=True, comment="是否激活（True=已订阅，False=已退订）")
     created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
@@ -56,7 +60,7 @@ class Subscription(Base):
                         comment="更新时间")
 
     def __repr__(self):
-        return f"<Subscription(chat_id='{self.chat_id}', vendor='{self.vendor}', active={self.is_active})>"
+        return f"<Subscription(platform='{self.platform}', conv_id='{self.conversation_id}', vendor='{self.vendor}', active={self.is_active})>"
 
 
 class ChatPreference(Base):
@@ -68,8 +72,11 @@ class ChatPreference(Base):
     __tablename__ = "chat_preferences"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(String(128), unique=True, nullable=False, index=True,
-                     comment="飞书 chat_id（群聊或私聊）")
+    platform = Column(String(32), default="feishu", nullable=False, index=True,
+                      comment="平台标识：feishu / telegram")
+    conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
+    chat_id = Column(String(128), nullable=True, index=True,
+                     comment="[过渡期兼容] 飞书 chat_id，等同于 conversation_id")
     push_time = Column(String(5), default="09:00", nullable=False,
                        comment="推送时间（HH:MM 格式，如 09:00）")
     frequency = Column(String(20), default="daily", nullable=False,
@@ -79,7 +86,7 @@ class ChatPreference(Base):
                         comment="更新时间")
 
     def __repr__(self):
-        return f"<ChatPreference(chat_id='{self.chat_id}', time='{self.push_time}', freq='{self.frequency}')>"
+        return f"<ChatPreference(platform='{self.platform}', conv_id='{self.conversation_id}', time='{self.push_time}', freq='{self.frequency}')>"
 
 
 class ChatRegistry(Base):
@@ -91,12 +98,15 @@ class ChatRegistry(Base):
     __tablename__ = "chat_registry"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(String(128), unique=True, nullable=False, index=True,
-                     comment="飞书 chat_id（群聊或私聊）")
+    platform = Column(String(32), default="feishu", nullable=False, index=True,
+                      comment="平台标识：feishu / telegram")
+    conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
+    chat_id = Column(String(128), nullable=True, index=True,
+                     comment="[过渡期兼容] 飞书 chat_id，等同于 conversation_id")
     chat_type = Column(String(16), default="group", nullable=False,
                        comment="chat 类型：group / user")
     owner_id = Column(String(128), nullable=True,
-                      comment="群主 open_id（仅 group 类型）")
+                      comment="群主/管理员 ID（仅 group 类型）")
     is_active = Column(Boolean, default=True, nullable=False,
                        comment="Bot 是否仍在该 chat 中")
     first_seen_at = Column(DateTime, default=datetime.utcnow, comment="首次发现时间")
@@ -104,4 +114,4 @@ class ChatRegistry(Base):
                             comment="最后活跃时间")
 
     def __repr__(self):
-        return f"<ChatRegistry(chat_id='{self.chat_id}', type='{self.chat_type}', active={self.is_active})>"
+        return f"<ChatRegistry(platform='{self.platform}', conv_id='{self.conversation_id}', type='{self.chat_type}', active={self.is_active})>"

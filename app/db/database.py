@@ -9,12 +9,59 @@ from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# 轻量迁移：需要检测的 MySQL 列
+# 轻量迁移：需要检测的 MySQL 列（增量式，幂等安全）
 _MIGRATIONS: list[dict] = [
     {
         "table": "news_articles",
         "column": "raw_content",
         "sql": "ALTER TABLE news_articles ADD COLUMN raw_content TEXT COMMENT '文章原始全文（供 RAG 检索和引用）'",
+    },
+    # ========== 多平台支持迁移 ==========
+    {
+        "table": "subscriptions",
+        "column": "platform",
+        "sql": "ALTER TABLE subscriptions ADD COLUMN platform VARCHAR(32) NOT NULL DEFAULT 'feishu' COMMENT '平台标识：feishu / telegram'",
+    },
+    {
+        "table": "subscriptions",
+        "column": "conversation_id",
+        "sql": "ALTER TABLE subscriptions ADD COLUMN conversation_id VARCHAR(128) NOT NULL DEFAULT '' COMMENT '平台原生的会话ID'",
+    },
+    {
+        "table": "chat_preferences",
+        "column": "platform",
+        "sql": "ALTER TABLE chat_preferences ADD COLUMN platform VARCHAR(32) NOT NULL DEFAULT 'feishu' COMMENT '平台标识：feishu / telegram'",
+    },
+    {
+        "table": "chat_preferences",
+        "column": "conversation_id",
+        "sql": "ALTER TABLE chat_preferences ADD COLUMN conversation_id VARCHAR(128) NOT NULL DEFAULT '' COMMENT '平台原生的会话ID'",
+    },
+    {
+        "table": "chat_registry",
+        "column": "platform",
+        "sql": "ALTER TABLE chat_registry ADD COLUMN platform VARCHAR(32) NOT NULL DEFAULT 'feishu' COMMENT '平台标识：feishu / telegram'",
+    },
+    {
+        "table": "chat_registry",
+        "column": "conversation_id",
+        "sql": "ALTER TABLE chat_registry ADD COLUMN conversation_id VARCHAR(128) NOT NULL DEFAULT '' COMMENT '平台原生的会话ID'",
+    },
+    # 数据回填：将现有 chat_id 复制到 conversation_id（仅空行）
+    {
+        "table": "subscriptions",
+        "column": "conversation_id_backfill",
+        "sql": "UPDATE subscriptions SET conversation_id = chat_id WHERE conversation_id = '' AND chat_id IS NOT NULL AND chat_id != ''",
+    },
+    {
+        "table": "chat_preferences",
+        "column": "conversation_id_backfill",
+        "sql": "UPDATE chat_preferences SET conversation_id = chat_id WHERE conversation_id = '' AND chat_id IS NOT NULL AND chat_id != ''",
+    },
+    {
+        "table": "chat_registry",
+        "column": "conversation_id_backfill",
+        "sql": "UPDATE chat_registry SET conversation_id = chat_id WHERE conversation_id = '' AND chat_id IS NOT NULL AND chat_id != ''",
     },
 ]
 

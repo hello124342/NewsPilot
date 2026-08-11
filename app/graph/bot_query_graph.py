@@ -26,24 +26,78 @@ def _route_by_query_type(state: QueryState) -> str:
 
 
 def _format_rag_response_node(state: QueryState) -> QueryState:
-    """将 RAG 答案格式化为飞书回复卡片
+    """将 RAG 答案格式化为平台无关 RichMessage + 飞书卡片
 
-    在 rag_answer 生成后调用，构建 RAG 答案卡片并写入 reply_card_json。
+    在 rag_answer 生成后调用，构建 RAG 答案并写入 rich_message 和 reply_card_json。
     """
-    try:
-        from app.feishu.card_builder import build_rag_answer_card
+    rag = state.get("rag_answer", {})
+    answer_text = rag.get("answer_text", "")
+    sources = rag.get("sources", [])
+    original_query = state.get("user_query", "")
 
-        rag = state.get("rag_answer", {})
+    try:
+        from app.platforms.message_model import RichMessage, ActionButton
+
+        # 构建 RichMessage（平台无关）
+        body_parts = []
+        if original_query:
+            q = original_query[:200] + "..." if len(original_query) > 200 else original_query
+            body_parts.append(f"💬 **你问：** {q}")
+            body_parts.append("")
+
+        body_parts.append(answer_text or "暂无答案")
+
+        # 来源按钮
+        buttons = []
+        if sources:
+            body_parts.append("")
+            body_parts.append("📚 **参考来源：**")
+            for i, src in enumerate(sources, 1):
+                vendor = src.get("vendor", "")
+                title = (src.get("title", "查看原文") or "查看原文")[:30]
+                label_parts = []
+                if vendor:
+                    label_parts.append(vendor)
+                label_parts.append(title)
+                label = f"📖 {' · '.join(label_parts)}"
+                if src.get("url"):
+                    buttons.append(ActionButton(
+                        label=label[:40],
+                        action="url",
+                        value=src["url"],
+                        style="default",
+                    ))
+
+        msg = RichMessage(
+            title="🤖 AI 行业情报",
+            body="\n".join(body_parts),
+            buttons=buttons,
+            color_hint="success",
+            footer="💡 发送「OpenAI 最近有什么新闻」查看最新动态" if not sources else None,
+        )
+
+        state["rich_message"] = {
+            "title": msg.title,
+            "body": msg.body,
+            "buttons": [
+                {"label": b.label, "action": b.action, "value": b.value, "style": b.style}
+                for b in msg.buttons
+            ],
+            "color_hint": msg.color_hint,
+            "footer": msg.footer,
+        }
+
+        # 同时构建飞书卡片（向后兼容）
+        from app.feishu.card_builder import build_rag_answer_card
         card = build_rag_answer_card(
-            answer_text=rag.get("answer_text", ""),
-            sources=rag.get("sources", []),
-            original_query=state.get("user_query", ""),
+            answer_text=answer_text,
+            sources=sources,
+            original_query=original_query,
         )
         state["reply_card_json"] = card
-        logger.info("RAG response card built")
+        logger.info("RAG response built (RichMessage + Feishu card)")
     except Exception as e:
         logger.error(f"format_rag_response_node failed: {e}")
-        # 兜底：构造简单错误卡片
         state["reply_card_json"] = {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -53,6 +107,11 @@ def _format_rag_response_node(state: QueryState) -> QueryState:
             "elements": [
                 {"tag": "div", "text": {"tag": "lark_md", "content": "请稍后再试，或发送「**OpenAI 最近有什么新闻**」查看最新动态。"}},
             ],
+        }
+        state["rich_message"] = {
+            "title": "⚠️ 出错了",
+            "body": "请稍后再试，或发送「OpenAI 最近有什么新闻」查看最新动态。",
+            "buttons": [], "color_hint": "warning", "footer": None,
         }
     return state
 

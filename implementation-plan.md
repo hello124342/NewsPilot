@@ -13,6 +13,19 @@
 > - 意图解析增强：Prompt 添加 "今天/昨天" 示例，降级时 `_extract_days_from_query()` 关键词提取
 > - MySQL `raw_content` 列自动迁移
 >
+> **v3 多平台适配（2026-08-11）：**
+> - Platform Adapter 模式：`PlatformAdapter` ABC → `FeishuAdapter` + `TelegramAdapter`
+> - 中立消息模型：`RichMessage`、`ActionButton`、`CallbackData`、`ConversationInfo`
+> - Telegram 完整接入：Webhook (`/webhook/telegram`) + 命令系统 + Markdown/InlineKeyboard 渲染
+> - 数据模型升级：3表加 `platform` + `conversation_id` 列（6 个自动迁移 + 数据回填）
+> - Repository/Facade 层全部 `platform` 感知（12 个方法签名升级，默认 `"feishu"` 保持向后兼容）
+> - Graph 节点解耦：`reply_feishu_node` 平台感知，`format_response`/`format_rag_response` 输出 RichMessage
+> - `deliver_job()` 多平台分发：按 platform 分组 + 各平台 Adapter 独立推送
+> - Telegram 权限控制：`TelegramAdapter.is_admin()` + `can_manage_subscription()` 多平台适配
+> - Telegram 群聊生命周期：`my_chat_member` 事件 → 自动注册 + 默认订阅 + 欢迎消息
+> - 新增 12 个平台层文件 + 9th ADR (`0009-multi-platform-adapter.md`)
+> - 247 测试零回归
+>
 > 后续新增功能（未在计划中）：
 > Twitter/Nitter 支持、订阅系统、推送时间/频率定制、Bot 自动发现、权限控制、双阶段推送。
 > 最新架构见 [CLAUDE.md](./CLAUDE.md)。

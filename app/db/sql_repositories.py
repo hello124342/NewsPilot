@@ -76,13 +76,14 @@ class SqlSubscriptionRepository(SubscriptionRepository):
 
     # ---- 订阅 CRUD ----
 
-    def subscribe(self, chat_id: str, vendor: str, db: Session | None = None) -> str:
+    def subscribe(self, chat_id: str, vendor: str, db: Session | None = None,
+                  platform: str = "feishu") -> str:
         if SessionLocal is None:
             return "❌ 系统未初始化，请稍后再试"
 
         def _do(session: Session):
             existing = session.query(Subscription).filter_by(
-                chat_id=chat_id, vendor=vendor
+                chat_id=chat_id, vendor=vendor, platform=platform
             ).first()
             if existing:
                 if existing.is_active:
@@ -91,10 +92,13 @@ class SqlSubscriptionRepository(SubscriptionRepository):
                 session.commit()
                 return f"✅ 已重新订阅 **{vendor}**"
 
-            sub = Subscription(chat_id=chat_id, vendor=vendor, is_active=True)
+            sub = Subscription(
+                platform=platform, conversation_id=chat_id,
+                chat_id=chat_id, vendor=vendor, is_active=True,
+            )
             session.add(sub)
             session.commit()
-            logger.info(f"Subscribed: chat_id={chat_id}, vendor={vendor}")
+            logger.info(f"Subscribed: platform={platform}, chat_id={chat_id}, vendor={vendor}")
             return f"✅ 已订阅 **{vendor}**，你将在每日推送中收到相关新闻"
 
         if db is not None:
@@ -115,19 +119,20 @@ class SqlSubscriptionRepository(SubscriptionRepository):
         finally:
             session.close()
 
-    def unsubscribe(self, chat_id: str, vendor: str, db: Session | None = None) -> str:
+    def unsubscribe(self, chat_id: str, vendor: str, db: Session | None = None,
+                    platform: str = "feishu") -> str:
         if SessionLocal is None:
             return "❌ 系统未初始化，请稍后再试"
 
         def _do(session: Session):
             existing = session.query(Subscription).filter_by(
-                chat_id=chat_id, vendor=vendor, is_active=True
+                chat_id=chat_id, vendor=vendor, is_active=True, platform=platform
             ).first()
             if not existing:
                 return f"⚠️ 你当前未订阅 **{vendor}**"
             existing.is_active = False
             session.commit()
-            logger.info(f"Unsubscribed: chat_id={chat_id}, vendor={vendor}")
+            logger.info(f"Unsubscribed: platform={platform}, chat_id={chat_id}, vendor={vendor}")
             return f"🔕 已退订 **{vendor}**，你不再收到相关新闻"
 
         if db is not None:
@@ -148,13 +153,14 @@ class SqlSubscriptionRepository(SubscriptionRepository):
         finally:
             session.close()
 
-    def list_active(self, chat_id: str, db: Session | None = None) -> list[str]:
+    def list_active(self, chat_id: str, db: Session | None = None,
+                    platform: str = "feishu") -> list[str]:
         if SessionLocal is None:
             return []
 
         def _query(session: Session):
             subs = session.query(Subscription).filter_by(
-                chat_id=chat_id, is_active=True
+                chat_id=chat_id, is_active=True, platform=platform
             ).all()
             return [s.vendor for s in subs]
 
@@ -170,29 +176,31 @@ class SqlSubscriptionRepository(SubscriptionRepository):
         finally:
             session.close()
 
-    def get_subscribers(self, vendor: str) -> list[str]:
+    def get_subscribers(self, vendor: str, platform: str = "feishu") -> list[str]:
         if SessionLocal is None:
             return []
 
         db = SessionLocal()
         try:
             subs = db.query(Subscription).filter_by(
-                vendor=vendor, is_active=True
+                vendor=vendor, is_active=True, platform=platform
             ).all()
-            return [s.chat_id for s in subs]
+            return [s.conversation_id or s.chat_id for s in subs]
         except Exception as e:
             logger.error(f"get_subscribers failed: {e}")
             return []
         finally:
             db.close()
 
-    def has_any(self, chat_id: str) -> bool:
+    def has_any(self, chat_id: str, platform: str = "feishu") -> bool:
         if SessionLocal is None:
             return False
 
         db = SessionLocal()
         try:
-            count = db.query(Subscription).filter_by(chat_id=chat_id).count()
+            count = db.query(Subscription).filter_by(
+                chat_id=chat_id, platform=platform
+            ).count()
             return count > 0
         except Exception:
             return False
@@ -201,8 +209,9 @@ class SqlSubscriptionRepository(SubscriptionRepository):
 
     # ---- 推送偏好 ----
 
-    def get_preference(self, chat_id: str, db: Session | None = None) -> dict:
-        cache_key = f"{chat_id}:pref"
+    def get_preference(self, chat_id: str, db: Session | None = None,
+                       platform: str = "feishu") -> dict:
+        cache_key = f"{platform}:{chat_id}:pref"
         cached = chat_pref_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -211,7 +220,9 @@ class SqlSubscriptionRepository(SubscriptionRepository):
             return {"push_time": "09:00", "frequency": "daily"}
 
         def _query(session: Session):
-            pref = session.query(ChatPreference).filter_by(chat_id=chat_id).first()
+            pref = session.query(ChatPreference).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             result = (
                 {"push_time": pref.push_time, "frequency": pref.frequency}
                 if pref
@@ -232,21 +243,27 @@ class SqlSubscriptionRepository(SubscriptionRepository):
         finally:
             session.close()
 
-    def set_push_time(self, chat_id: str, push_time: str, db: Session | None = None) -> dict:
+    def set_push_time(self, chat_id: str, push_time: str, db: Session | None = None,
+                      platform: str = "feishu") -> dict:
         if SessionLocal is None:
             return {"push_time": push_time, "frequency": "daily"}
 
         def _do(session: Session):
-            pref = session.query(ChatPreference).filter_by(chat_id=chat_id).first()
+            pref = session.query(ChatPreference).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             if pref:
                 pref.push_time = push_time
             else:
-                pref = ChatPreference(chat_id=chat_id, push_time=push_time)
+                pref = ChatPreference(
+                    platform=platform, conversation_id=chat_id,
+                    chat_id=chat_id, push_time=push_time,
+                )
                 session.add(pref)
             session.commit()
             result = {"push_time": pref.push_time, "frequency": pref.frequency}
-            chat_pref_cache.set(f"{chat_id}:pref", result)
-            logger.info(f"Push time set: chat_id={chat_id}, time={push_time}")
+            chat_pref_cache.set(f"{platform}:{chat_id}:pref", result)
+            logger.info(f"Push time set: platform={platform}, chat_id={chat_id}, time={push_time}")
             return result
 
         if db is not None:
@@ -267,21 +284,27 @@ class SqlSubscriptionRepository(SubscriptionRepository):
         finally:
             session.close()
 
-    def set_frequency(self, chat_id: str, frequency: str, db: Session | None = None) -> dict:
+    def set_frequency(self, chat_id: str, frequency: str, db: Session | None = None,
+                      platform: str = "feishu") -> dict:
         if SessionLocal is None:
             return {"push_time": "09:00", "frequency": frequency}
 
         def _do(session: Session):
-            pref = session.query(ChatPreference).filter_by(chat_id=chat_id).first()
+            pref = session.query(ChatPreference).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             if pref:
                 pref.frequency = frequency
             else:
-                pref = ChatPreference(chat_id=chat_id, frequency=frequency)
+                pref = ChatPreference(
+                    platform=platform, conversation_id=chat_id,
+                    chat_id=chat_id, frequency=frequency,
+                )
                 session.add(pref)
             session.commit()
             result = {"push_time": pref.push_time, "frequency": pref.frequency}
-            chat_pref_cache.set(f"{chat_id}:pref", result)
-            logger.info(f"Frequency set: chat_id={chat_id}, freq={frequency}")
+            chat_pref_cache.set(f"{platform}:{chat_id}:pref", result)
+            logger.info(f"Frequency set: platform={platform}, chat_id={chat_id}, freq={frequency}")
             return result
 
         if db is not None:
@@ -387,25 +410,31 @@ class SqlSubscriptionRepository(SubscriptionRepository):
 class SqlChatRegistryRepository(ChatRegistryRepository):
     """Chat 注册表管理的 SQLAlchemy 实现"""
 
-    def register(self, chat_id: str, chat_type: Literal["group", "user"] = "group") -> bool:
+    def register(self, chat_id: str, chat_type: Literal["group", "user"] = "group",
+                 platform: str = "feishu") -> bool:
         if SessionLocal is None:
             return False
 
         db = SessionLocal()
         try:
-            existing = db.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            existing = db.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             if existing:
                 existing.is_active = True
                 existing.last_active_at = datetime.now(timezone.utc)
                 db.commit()
-                logger.info(f"Chat re-activated: {chat_id} ({chat_type})")
+                logger.info(f"Chat re-activated: {platform}/{chat_id} ({chat_type})")
                 return False
 
-            entry = ChatRegistry(chat_id=chat_id, chat_type=chat_type, is_active=True)
+            entry = ChatRegistry(
+                platform=platform, conversation_id=chat_id,
+                chat_id=chat_id, chat_type=chat_type, is_active=True,
+            )
             db.add(entry)
             db.commit()
-            chat_meta_cache.set(f"{chat_id}:type", chat_type)
-            logger.info(f"Chat registered: {chat_id} ({chat_type})")
+            chat_meta_cache.set(f"{platform}:{chat_id}:type", chat_type)
+            logger.info(f"Chat registered: {platform}/{chat_id} ({chat_type})")
             return True
         except Exception as e:
             db.rollback()
@@ -414,32 +443,36 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         finally:
             db.close()
 
-    def deactivate(self, chat_id: str) -> None:
+    def deactivate(self, chat_id: str, platform: str = "feishu") -> None:
         if SessionLocal is None:
             return
 
         db = SessionLocal()
         try:
-            entry = db.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            entry = db.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             if entry:
                 entry.is_active = False
                 db.commit()
-                chat_meta_cache.delete(f"{chat_id}:type")
-                chat_meta_cache.delete(f"{chat_id}:owner")
-                logger.info(f"Chat deactivated: {chat_id}")
+                chat_meta_cache.delete(f"{platform}:{chat_id}:type")
+                chat_meta_cache.delete(f"{platform}:{chat_id}:owner")
+                logger.info(f"Chat deactivated: {platform}/{chat_id}")
         except Exception as e:
             db.rollback()
             logger.error(f"deactivate failed: {e}")
         finally:
             db.close()
 
-    def is_new(self, chat_id: str) -> bool:
+    def is_new(self, chat_id: str, platform: str = "feishu") -> bool:
         if SessionLocal is None:
             return True
 
         db = SessionLocal()
         try:
-            exists = db.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            exists = db.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             return exists is None
         except Exception:
             return True
@@ -463,8 +496,9 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
     def get_active_chat_ids(self) -> list[str]:
         return [c["chat_id"] for c in self.get_active_chats()]
 
-    def get_type(self, chat_id: str, db: Session | None = None) -> str | None:
-        cache_key = f"{chat_id}:type"
+    def get_type(self, chat_id: str, db: Session | None = None,
+                 platform: str = "feishu") -> str | None:
+        cache_key = f"{platform}:{chat_id}:type"
         cached = chat_meta_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -473,7 +507,9 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
             return None
 
         def _query(session: Session):
-            entry = session.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            entry = session.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             result = entry.chat_type if entry else None
             if result:
                 chat_meta_cache.set(cache_key, result)
@@ -490,8 +526,9 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         finally:
             session.close()
 
-    def get_owner_id(self, chat_id: str, db: Session | None = None) -> str | None:
-        cache_key = f"{chat_id}:owner"
+    def get_owner_id(self, chat_id: str, db: Session | None = None,
+                     platform: str = "feishu") -> str | None:
+        cache_key = f"{platform}:{chat_id}:owner"
         cached = chat_meta_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -500,7 +537,9 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
             return None
 
         def _query(session: Session):
-            entry = session.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            entry = session.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             result = entry.owner_id if entry else None
             if result:
                 chat_meta_cache.set(cache_key, result)
@@ -517,17 +556,20 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         finally:
             session.close()
 
-    def set_owner_id(self, chat_id: str, owner_id: str) -> None:
+    def set_owner_id(self, chat_id: str, owner_id: str,
+                     platform: str = "feishu") -> None:
         if SessionLocal is None:
             return
 
         db = SessionLocal()
         try:
-            entry = db.query(ChatRegistry).filter_by(chat_id=chat_id).first()
+            entry = db.query(ChatRegistry).filter_by(
+                chat_id=chat_id, platform=platform
+            ).first()
             if entry:
                 entry.owner_id = owner_id
                 db.commit()
-                chat_meta_cache.set(f"{chat_id}:owner", owner_id)
+                chat_meta_cache.set(f"{platform}:{chat_id}:owner", owner_id)
         except Exception as e:
             db.rollback()
             logger.error(f"set_owner_id failed: {e}")
@@ -538,20 +580,42 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         self, chat_id: str, sender_id: str,
         db: Session | None = None,
         feishu_client=None,
+        platform: str = "feishu",
+        platform_adapter=None,
     ) -> bool:
-        chat_type = self.get_type(chat_id, db=db)
+        """检查 sender 是否有权限管理此 chat 的订阅
+
+        权限模型：
+          - 私聊：总是有权限
+          - 群聊：仅群主/管理员有权限
+          - 未知类型：fail-open（有权限）
+
+        平台适配：
+          - 飞书：通过 feishu_client.get_chat_info() 查询群主 open_id
+          - Telegram：通过 platform_adapter.is_admin() 检查管理员身份
+          - feishu_client 参数保留向后兼容（过渡期）
+        """
+        chat_type = self.get_type(chat_id, db=db, platform=platform)
 
         if chat_type == "user":
             return True
         if chat_type is None:
             return True
 
-        owner_id = self.get_owner_id(chat_id, db=db)
+        # Telegram: 使用 platform_adapter.is_admin()
+        if platform == "telegram" and platform_adapter:
+            try:
+                return platform_adapter.is_admin(chat_id, sender_id)
+            except Exception:
+                return True  # fail open
+
+        # 飞书: 缓存 owner_id 对比
+        owner_id = self.get_owner_id(chat_id, db=db, platform=platform)
         if not owner_id and feishu_client:
             try:
                 info = feishu_client.get_chat_info(chat_id)
                 if info and info.get("owner_id"):
-                    self.set_owner_id(chat_id, info["owner_id"])
+                    self.set_owner_id(chat_id, info["owner_id"], platform=platform)
                     return sender_id == info["owner_id"]
             except Exception:
                 pass
