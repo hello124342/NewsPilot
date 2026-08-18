@@ -65,9 +65,45 @@ _MIGRATIONS: list[dict] = [
     },
 ]
 
+# 索引迁移：与列迁移分开，因为检测方式不同（get_indexes 而非 get_columns）
+# 说明：(platform, conversation_id) 是多平台改造后的主查询键，此前完全没有索引；
+# news_articles 按 published_at 过滤+倒序，同样缺索引，数据量上来后是全表扫描。
+_INDEX_MIGRATIONS: list[dict] = [
+    {
+        "table": "news_articles",
+        "index": "ix_news_articles_published_at",
+        "sql": "CREATE INDEX ix_news_articles_published_at ON news_articles (published_at)",
+    },
+    {
+        "table": "news_articles",
+        "index": "ix_news_articles_vendor_published",
+        "sql": "CREATE INDEX ix_news_articles_vendor_published ON news_articles (vendor, published_at)",
+    },
+    {
+        "table": "subscriptions",
+        "index": "ix_subscriptions_platform_conv",
+        "sql": "CREATE INDEX ix_subscriptions_platform_conv ON subscriptions (platform, conversation_id)",
+    },
+    {
+        "table": "chat_preferences",
+        "index": "ix_chat_preferences_platform_conv",
+        "sql": "CREATE INDEX ix_chat_preferences_platform_conv ON chat_preferences (platform, conversation_id)",
+    },
+    {
+        "table": "chat_registry",
+        "index": "ix_chat_registry_platform_conv",
+        "sql": "CREATE INDEX ix_chat_registry_platform_conv ON chat_registry (platform, conversation_id)",
+    },
+    {
+        "table": "chat_registry",
+        "index": "ix_chat_registry_platform_active",
+        "sql": "CREATE INDEX ix_chat_registry_platform_active ON chat_registry (platform, is_active)",
+    },
+]
+
 
 def _run_migrations():
-    """检测并补全缺失的数据库列（不更改已有列，安全幂等）"""
+    """检测并补全缺失的数据库列与索引（不更改已有对象，安全幂等）"""
     if engine is None or SessionLocal is None:
         logger.warning("Database not initialized, skipping migrations")
         return
@@ -88,6 +124,30 @@ def _run_migrations():
                 logger.debug(f"Migration skipped: {table}.{column} already exists")
         except Exception as e:
             logger.error(f"Migration check failed for {table}.{column}: {e}")
+
+    _run_index_migrations(inspector)
+
+
+def _run_index_migrations(inspector):
+    """补全缺失的索引（幂等：已存在则跳过）
+
+    新建库由 Base.metadata.create_all() 直接带上索引，这里只处理存量库。
+    """
+    for migration in _INDEX_MIGRATIONS:
+        table = migration["table"]
+        index = migration["index"]
+        try:
+            existing = {idx["name"] for idx in inspector.get_indexes(table)}
+            if index in existing:
+                logger.debug(f"Index migration skipped: {index} already exists")
+                continue
+            logger.info(f"Running index migration: {migration['sql']}")
+            with engine.connect() as conn:
+                conn.execute(text(migration["sql"]))
+                conn.commit()
+            logger.info(f"Index migration complete: {index} created on {table}")
+        except Exception as e:
+            logger.error(f"Index migration failed for {table}.{index}: {e}")
 
 
 def create_engine_from_settings(settings: Settings):

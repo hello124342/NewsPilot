@@ -10,6 +10,7 @@
 """
 import logging
 import os
+import threading
 from typing import Optional
 
 import chromadb
@@ -27,11 +28,19 @@ _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "chroma_data")
 _client: Optional[chromadb.PersistentClient] = None
 _collection: Optional[chromadb.Collection] = None
 
+# 惰性初始化锁（双检查锁，防并发首次调用竞态 —— 多用户并发查询可能同时触发初始化）
+# 用 RLock：get_collection() 持锁后还会调用 _get_client() 再次取锁，需可重入
+_init_lock = threading.RLock()
+
 
 def _get_client() -> chromadb.PersistentClient:
-    """获取或初始化 ChromaDB 持久化客户端"""
+    """获取或初始化 ChromaDB 持久化客户端（线程安全）"""
     global _client
-    if _client is None:
+    if _client is not None:
+        return _client
+    with _init_lock:
+        if _client is not None:  # 双检查：另一个线程可能已完成初始化
+            return _client
         os.makedirs(_DATA_DIR, exist_ok=True)
         # PersistentClient 在 ChromaDB >= 0.5 中是标准持久化方式
         try:
@@ -47,13 +56,17 @@ def _get_client() -> chromadb.PersistentClient:
 
 
 def get_collection() -> chromadb.Collection:
-    """获取或创建 'news_articles' collection
+    """获取或创建 'news_articles' collection（线程安全）
 
     Collection 使用默认 embedding function（由 embedder 预先计算向量后传入）。
     不绑定 ChromaDB 内置 embedding function，确保向量由我们控制。
     """
     global _collection
-    if _collection is None:
+    if _collection is not None:
+        return _collection
+    with _init_lock:
+        if _collection is not None:  # 双检查
+            return _collection
         client = _get_client()
         try:
             _collection = client.get_collection(name=COLLECTION_NAME)
@@ -169,10 +182,11 @@ def collection_count() -> int:
 def reset_collection() -> None:
     """重置 collection（删除全部数据，用于测试）"""
     global _collection
-    client = _get_client()
-    try:
-        client.delete_collection(name=COLLECTION_NAME)
-    except Exception:
-        pass
-    _collection = None
+    with _init_lock:
+        client = _get_client()
+        try:
+            client.delete_collection(name=COLLECTION_NAME)
+        except Exception:
+            pass
+        _collection = None
     logger.info("ChromaDB collection reset")

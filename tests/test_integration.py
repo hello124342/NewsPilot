@@ -311,17 +311,22 @@ class TestAdminEndpoints:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
-    def test_trigger_rss_endpoint(self):
+    def test_trigger_rss_endpoint(self, monkeypatch):
         """测试手动触发 RSS 端点（mock 整个 process_rss_job）"""
         from fastapi.testclient import TestClient
         from unittest.mock import patch
+
+        # /admin/* 需要鉴权，未配置令牌时端点整体禁用（fail-closed）
+        monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
 
         with patch("app.main.process_rss_job") as mock_job:
             mock_job.return_value = {"status": "ok", "processed": 3}
             from app.main import app
 
             client = TestClient(app)
-            response = client.post("/admin/trigger-rss")
+            response = client.post(
+                "/admin/trigger-rss", headers={"X-Admin-Token": "test-admin-token"}
+            )
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "ok"

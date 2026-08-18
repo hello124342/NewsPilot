@@ -33,8 +33,8 @@ Thumbs.db
 # Claude Code local settings
 .claude/settings.local.json
 
-# Lock files (auto-generated)
-requirements-lock.txt
+# 注意：requirements-lock.txt 必须提交（requirements.txt 指示生产环境从它安装），
+# 曾被误加入本文件导致「生产依赖锁文件不在版本库里」。生成方式见 requirements.txt 顶部。
 
 # ChromaDB 向量库数据
 chroma_data/

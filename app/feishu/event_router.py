@@ -16,28 +16,25 @@ Worker 线程并行处理事件（LLM 调用、DB 操作、卡片发送）。
 import json
 import logging
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import lark_oapi as lark
 from app.core.config import Settings
+from app.core.query_executor import submit as query_submit, QuerySubmitStatus
 from app.subscription.handler import detect_command
 
 logger = logging.getLogger(__name__)
 
-# ========== 事件处理线程池 ==========
-# max_workers=5: LLM API 调用是主要瓶颈（1-3秒），5 个并发足够覆盖正常负载。
-# 更多 worker 受 LLM rate limit 约束，不会提升吞吐。
-_event_executor = ThreadPoolExecutor(
-    max_workers=5,
-    thread_name_prefix="event-worker",
-)
+# ========== 事件处理：统一派发到共享查询池 ==========
+# 并发模型（Producer-Consumer，见 app/core/query_executor.py）：
+# - Producer: WS 线程 → query_executor.submit() 立即返回，不阻塞
+# - Consumer: ThreadPoolExecutor(QUERY_MAX_WORKERS) 执行业务逻辑
+# 有界队列打满或用户触发限流时丢弃，消息路径回「系统繁忙」卡片提示。
 
 
-def _dispatch_async(fn, *args, **kwargs):
-    """将事件处理提交到线程池，worker 内部异常隔离
+def _dispatch_async(fn, *args, user_id=None, **kwargs):
+    """将事件处理提交到共享查询池（fire-and-forget）
 
-    WS 线程调用此函数后立即返回（fire-and-forget）。
+    WS 线程调用此函数后立即返回。
     异常在 worker 内部捕获并记录日志，不传播到 WS 线程导致断连。
     """
 
@@ -47,18 +44,58 @@ def _dispatch_async(fn, *args, **kwargs):
         except Exception:
             logger.exception(f"Unhandled error in event worker: {fn.__name__}")
 
-    return _event_executor.submit(_safe)
+    return query_submit(_safe, user_id=user_id)
 
 
 def shutdown_executor(wait: bool = True) -> None:
-    """优雅关闭事件处理线程池（由 main.py lifespan 调用）
+    """优雅关闭查询池（由 main.py lifespan 调用）
 
     Args:
         wait: True 等待正在处理的请求完成后再关闭
     """
-    logger.info("Shutting down event executor...")
-    _event_executor.shutdown(wait=wait, cancel_futures=False)
+    from app.core.query_executor import shutdown as query_shutdown
+    query_shutdown(wait=wait)
     logger.info("Event executor shut down")
+
+
+def _dispatch_message_event(e, feishu) -> None:
+    """派发 @Bot 消息到查询池；被丢弃时回「系统繁忙」卡片
+
+    限流 / 队列打满时用户会立即收到一条提示卡片，而非消息无声消失。
+    """
+    chat_id = ""
+    sender_id = ""
+    try:
+        if e.event.message:
+            chat_id = e.event.message.chat_id or ""
+        if e.event.sender and e.event.sender.sender_id:
+            sender_id = e.event.sender.sender_id.open_id or ""
+    except Exception:
+        pass
+
+    status = query_submit(lambda: handle_message(e, feishu), user_id=sender_id)
+    if status is not QuerySubmitStatus.ACCEPTED:
+        _send_busy_card(feishu, chat_id)
+
+
+def _send_busy_card(feishu, chat_id: str) -> None:
+    """发送「系统繁忙」提示卡片（查询被丢弃时）"""
+    if not chat_id or not feishu:
+        return
+    try:
+        busy_card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "orange",
+                "title": {"tag": "plain_text", "content": "⛔ 系统繁忙"},
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "当前查询人数较多，请稍后再试。"}},
+            ],
+        }
+        feishu.send_card(chat_id, busy_card)
+    except Exception as e:
+        logger.warning(f"Failed to send busy card to {chat_id}: {e}")
 
 # 消息去重缓存（避免 WS 重连导致的重复事件）
 _seen_messages: OrderedDict[str, bool] = OrderedDict()
@@ -558,7 +595,7 @@ def build_event_handler(feishu_client_obj):
     return (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(
-            lambda e: _dispatch_async(handle_message, e, feishu)
+            lambda e: _dispatch_message_event(e, feishu)
         )
         .register_p2_im_chat_member_bot_added_v1(
             lambda e: _dispatch_async(handle_bot_added, e, feishu)

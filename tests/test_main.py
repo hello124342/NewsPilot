@@ -1,10 +1,17 @@
 """FastAPI 入口与调度器集成测试
 
-测试健康检查、管理端点和 APScheduler 调度任务。
+测试健康检查、管理端点鉴权和 APScheduler 调度任务。
 飞书事件通过 WebSocket 长连接接收，不再测试 webhook 端点。
 """
 import pytest
 from unittest.mock import patch, Mock, MagicMock
+
+
+@pytest.fixture
+def admin_token(monkeypatch):
+    """配置管理端点令牌（verify_admin_token 在请求时新建 Settings，读环境变量生效）"""
+    monkeypatch.setenv("ADMIN_API_TOKEN", "test-admin-token")
+    return "test-admin-token"
 
 
 class TestEndpoints:
@@ -32,17 +39,72 @@ class TestEndpoints:
         assert b"feishu_bot_" in response.content
 
     @patch("app.main.process_rss_job")
-    def test_manual_trigger_rss_endpoint(self, mock_job):
-        """测试手动触发 RSS 抓取端点"""
+    def test_manual_trigger_rss_endpoint(self, mock_job, admin_token):
+        """测试手动触发 RSS 抓取端点（带合法令牌）"""
         mock_job.return_value = {"status": "ok", "processed": 3}
 
         from app.main import app
         from fastapi.testclient import TestClient
 
         client = TestClient(app)
-        response = client.post("/admin/trigger-rss")
+        response = client.post("/admin/trigger-rss", headers={"X-Admin-Token": admin_token})
         assert response.status_code == 200
         assert response.json()["processed"] == 3
+
+
+class TestAdminAuth:
+    """管理端点鉴权测试
+
+    /admin/* 可触发全量群发和批量 embedding 计费，必须鉴权且默认关闭。
+    """
+
+    ENDPOINTS = [
+        "/admin/trigger-rss",
+        "/admin/backfill-chromadb",
+        "/admin/trigger-push",
+        "/admin/test-card",
+    ]
+
+    def _client(self):
+        from app.main import app
+        from fastapi.testclient import TestClient
+        return TestClient(app)
+
+    @pytest.mark.parametrize("path", ENDPOINTS)
+    def test_disabled_when_token_not_configured(self, path, monkeypatch):
+        """未配置 ADMIN_API_TOKEN 时 fail-closed：整体禁用而非放行"""
+        monkeypatch.setenv("ADMIN_API_TOKEN", "")
+        response = self._client().post(path)
+        assert response.status_code == 503
+        assert "disabled" in response.json()["detail"].lower()
+
+    @pytest.mark.parametrize("path", ENDPOINTS)
+    def test_missing_token_rejected(self, path, admin_token):
+        """已配置令牌但请求不带 header → 401"""
+        response = self._client().post(path)
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize("path", ENDPOINTS)
+    def test_wrong_token_rejected(self, path, admin_token):
+        """令牌错误 → 401"""
+        response = self._client().post(path, headers={"X-Admin-Token": "wrong"})
+        assert response.status_code == 401
+
+    @patch("app.main.deliver_job")
+    def test_valid_token_accepted(self, mock_deliver, admin_token):
+        """合法令牌放行，业务逻辑被真正调用"""
+        mock_deliver.return_value = {"status": "ok", "sent": 0}
+        response = self._client().post(
+            "/admin/trigger-push", headers={"X-Admin-Token": admin_token}
+        )
+        assert response.status_code == 200
+        mock_deliver.assert_called_once()
+
+    def test_health_endpoints_remain_public(self, admin_token):
+        """健康检查和指标端点不受鉴权影响"""
+        client = self._client()
+        assert client.get("/health").status_code == 200
+        assert client.get("/metrics").status_code == 200
 
 
 class TestRssJob:

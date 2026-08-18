@@ -6,11 +6,13 @@ FastAPI route 接收 Telegram webhook 推送的 Update 对象。
 
 import json
 import logging
+from collections import OrderedDict
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response, HTTPException
 
 from app.core.config import Settings
+from app.core.query_executor import submit as query_submit, QuerySubmitStatus
 from app.platforms.adapter import MessageCallback, CallbackActionHandler
 from app.platforms.message_model import IncomingMessage, CallbackData
 
@@ -28,6 +30,47 @@ _on_callback: Optional[CallbackActionHandler] = None
 
 # 配置引用（用于 webhook secret 校验）
 _settings: Optional[Settings] = None
+
+
+# ========== 更新去重 ==========
+# Telegram 网络重试可能重复推送同一条 update，按 update_id 去重。
+
+_seen_updates: OrderedDict[int, bool] = OrderedDict()
+_MAX_DEDUP = 2000
+
+
+def _dedup_update(update_id) -> bool:
+    """检查 update_id 是否已处理过。返回 True 表示重复。"""
+    if not update_id:
+        return False
+    if update_id in _seen_updates:
+        return True
+    _seen_updates[update_id] = True
+    if len(_seen_updates) > _MAX_DEDUP:
+        _seen_updates.popitem(last=False)
+    return False
+
+
+def _notify_dropped(chat_id: str, status: QuerySubmitStatus) -> None:
+    """查询被丢弃时给用户回一条提示（队列满 / 限流）
+
+    同步发送单条消息（快，不涉及 LLM），确保用户有反馈而非无声消失。
+    """
+    if not chat_id:
+        return
+    try:
+        from app.platforms.registry import get_platform_adapter
+        from app.platforms.message_model import RichMessage
+        from app.core.config import Settings as AppSettings
+
+        settings = AppSettings()  # type: ignore[call-arg]
+        adapter = get_platform_adapter("telegram", settings)
+        if adapter is None:
+            return
+        body = "🐌 操作太频繁，请稍后再试。" if status is QuerySubmitStatus.RATE_LIMITED else "⛔ 系统繁忙，请稍后再试。"
+        adapter.send_message(chat_id, RichMessage(body=body, color_hint="warning"))
+    except Exception as e:
+        logger.warning(f"Failed to send busy message to {chat_id}: {e}")
 
 
 def configure_webhook(
@@ -81,24 +124,31 @@ async def handle_telegram_webhook(request: Request) -> Response:
 
     logger.debug(f"Telegram webhook received: {json.dumps(body, ensure_ascii=False)[:500]}")
 
-    # 处理 message
+    # 去重：Telegram 网络重试可能重复推送同一条 update
+    if _dedup_update(body.get("update_id")):
+        return Response(status_code=200, content="OK")
+
+    # 处理 message（提交到查询池，不阻塞事件循环）
     if "message" in body:
-        await _handle_message(body["message"])
+        _handle_message(body["message"])
 
     # 处理 callback_query
     elif "callback_query" in body:
-        await _handle_callback(body["callback_query"])
+        _handle_callback(body["callback_query"])
 
     # 处理 my_chat_member（Bot 被添加/移除/权限变更）
     elif "my_chat_member" in body:
-        await _handle_my_chat_member(body["my_chat_member"])
+        _handle_my_chat_member(body["my_chat_member"])
 
-    # Telegram 要求返回 200
+    # Telegram 要求返回 200（已入队异步处理，立即返回）
     return Response(status_code=200, content="OK")
 
 
-async def _handle_message(msg: dict) -> None:
-    """处理 Telegram 消息事件"""
+def _handle_message(msg: dict) -> None:
+    """处理 Telegram 消息事件
+
+    解析后提交到共享查询池（fire-and-forget），不阻塞 webhook 事件循环。
+    """
     if _on_message is None:
         logger.warning("Telegram message handler not configured, ignoring message")
         return
@@ -127,14 +177,16 @@ async def _handle_message(msg: dict) -> None:
         raw_payload=msg,
     )
 
-    try:
-        _on_message(incoming)
-    except Exception as e:
-        logger.error(f"Error processing Telegram message: {e}", exc_info=True)
+    status = query_submit(_on_message, incoming, user_id=sender_id)
+    if status is not QuerySubmitStatus.ACCEPTED:
+        _notify_dropped(chat_id, status)
 
 
-async def _handle_callback(cb: dict) -> None:
-    """处理 Telegram 按钮回调"""
+def _handle_callback(cb: dict) -> None:
+    """处理 Telegram 按钮回调
+
+    解析后提交到共享查询池（fire-and-forget），不阻塞 webhook 事件循环。
+    """
     if _on_callback is None:
         logger.warning("Telegram callback handler not configured, ignoring callback")
         return
@@ -156,13 +208,12 @@ async def _handle_callback(cb: dict) -> None:
     # 这里只记录并转发，ack 由上层或外部处理
     logger.debug(f"Telegram callback: action={callback_data.action}, chat={chat_id}")
 
-    try:
-        _on_callback(callback_data, chat_id, sender_id)
-    except Exception as e:
-        logger.error(f"Error processing Telegram callback: {e}", exc_info=True)
+    status = query_submit(_on_callback, callback_data, chat_id, sender_id, user_id=sender_id)
+    if status is not QuerySubmitStatus.ACCEPTED:
+        _notify_dropped(chat_id, status)
 
 
-async def _handle_my_chat_member(update: dict) -> None:
+def _handle_my_chat_member(update: dict) -> None:
     """处理 Bot 自身在群聊中的成员状态变更
 
     my_chat_member 事件结构：
@@ -173,6 +224,7 @@ async def _handle_my_chat_member(update: dict) -> None:
         "new_chat_member": {"status": "member" | "administrator" | "left" | "kicked", ...},
       }
 
+    解析后提交到共享查询池（fire-and-forget），不阻塞 webhook 事件循环。
     当 Bot 被添加到群聊 → 注册 + 自动订阅 + 欢迎消息
     当 Bot 被移出群聊 → 标记 inactive
     """
@@ -191,6 +243,13 @@ async def _handle_my_chat_member(update: dict) -> None:
         f"old={old_status}, new={new_status}, from={inviter_id}"
     )
 
+    status = query_submit(_process_my_chat_member, chat_id, old_status, new_status)
+    if status is not QuerySubmitStatus.ACCEPTED:
+        logger.warning(f"Telegram my_chat_member dropped for chat {chat_id} (pool busy)")
+
+
+def _process_my_chat_member(chat_id: str, old_status: str, new_status: str) -> None:
+    """Bot 成员状态变更的实际处理（在查询池 worker 中执行）"""
     # Bot 被添加到群聊（从非成员 → 成员/管理员）
     if old_status in ("left", "kicked", "") and new_status in ("member", "administrator"):
         try:
@@ -209,7 +268,6 @@ async def _handle_my_chat_member(update: dict) -> None:
             try:
                 from app.platforms.registry import get_platform_adapter
                 from app.platforms.message_model import RichMessage
-                from app.core.config import Settings
 
                 settings = Settings()  # type: ignore[call-arg]
                 adapter = get_platform_adapter("telegram", settings)

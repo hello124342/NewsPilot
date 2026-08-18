@@ -22,12 +22,14 @@ logger = logging.getLogger(__name__)
 _PLATFORM_ADAPTER_REGISTRY: dict[str, str] = {
     "feishu": "app.platforms.feishu.adapter:FeishuAdapter",
     "telegram": "app.platforms.telegram.adapter:TelegramAdapter",
+    "discord": "app.platforms.discord.adapter:DiscordAdapter",
 }
 
 # 平台名 → 是否需要配置才能启用
 _PLATFORM_REQUIRES_CONFIG: dict[str, list[str]] = {
     "feishu": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
     "telegram": ["TELEGRAM_BOT_TOKEN"],
+    "discord": ["DISCORD_BOT_TOKEN"],
 }
 
 

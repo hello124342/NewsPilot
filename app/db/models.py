@@ -3,7 +3,7 @@
 NewsArticle 表存储已处理的 AI 新闻元数据。
 """
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, Index
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -35,6 +35,13 @@ class NewsArticle(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
                         comment="记录更新时间")
 
+    # deliver_job 与 search_db 都按 published_at 过滤+倒序；(vendor, published_at)
+    # 复合索引同时覆盖「按厂商查最近文章」和单独按厂商查询（最左前缀）
+    __table_args__ = (
+        Index("ix_news_articles_published_at", "published_at"),
+        Index("ix_news_articles_vendor_published", "vendor", "published_at"),
+    )
+
     def __repr__(self):
         return f"<NewsArticle(id={self.id}, vendor='{self.vendor}', title='{self.title[:30]}...')>"
 
@@ -48,7 +55,7 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    platform = Column(String(32), default="feishu", nullable=False, index=True,
+    platform = Column(String(32), default="feishu", nullable=False,
                       comment="平台标识：feishu / telegram")
     conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
     chat_id = Column(String(128), nullable=True, index=True,
@@ -58,6 +65,12 @@ class Subscription(Base):
     created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
                         comment="更新时间")
+
+    # (platform, conversation_id) 是多平台改造后的主查询键；复合索引的最左前缀
+    # 同时覆盖单独按 platform 查询，因此 platform 列不再单独建索引
+    __table_args__ = (
+        Index("ix_subscriptions_platform_conv", "platform", "conversation_id"),
+    )
 
     def __repr__(self):
         return f"<Subscription(platform='{self.platform}', conv_id='{self.conversation_id}', vendor='{self.vendor}', active={self.is_active})>"
@@ -72,7 +85,7 @@ class ChatPreference(Base):
     __tablename__ = "chat_preferences"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    platform = Column(String(32), default="feishu", nullable=False, index=True,
+    platform = Column(String(32), default="feishu", nullable=False,
                       comment="平台标识：feishu / telegram")
     conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
     chat_id = Column(String(128), nullable=True, index=True,
@@ -84,6 +97,10 @@ class ChatPreference(Base):
     created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
                         comment="更新时间")
+
+    __table_args__ = (
+        Index("ix_chat_preferences_platform_conv", "platform", "conversation_id"),
+    )
 
     def __repr__(self):
         return f"<ChatPreference(platform='{self.platform}', conv_id='{self.conversation_id}', time='{self.push_time}', freq='{self.frequency}')>"
@@ -98,7 +115,7 @@ class ChatRegistry(Base):
     __tablename__ = "chat_registry"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    platform = Column(String(32), default="feishu", nullable=False, index=True,
+    platform = Column(String(32), default="feishu", nullable=False,
                       comment="平台标识：feishu / telegram")
     conversation_id = Column(String(128), nullable=False, comment="平台原生的会话ID")
     chat_id = Column(String(128), nullable=True, index=True,
@@ -112,6 +129,12 @@ class ChatRegistry(Base):
     first_seen_at = Column(DateTime, default=datetime.utcnow, comment="首次发现时间")
     last_active_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
                             comment="最后活跃时间")
+
+    # 推送时按 (platform, is_active) 扫描全部活跃会话，按 (platform, conversation_id) 查单个
+    __table_args__ = (
+        Index("ix_chat_registry_platform_conv", "platform", "conversation_id"),
+        Index("ix_chat_registry_platform_active", "platform", "is_active"),
+    )
 
     def __repr__(self):
         return f"<ChatRegistry(platform='{self.platform}', conv_id='{self.conversation_id}', type='{self.chat_type}', active={self.is_active})>"

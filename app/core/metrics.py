@@ -188,6 +188,39 @@ rag_query_total = Counter(
     registry=_registry,
 )
 
+# ========== Query Executor（并发查询池）==========
+
+query_queue_depth = Gauge(
+    "feishu_bot_query_queue_depth",
+    "Number of queries currently pending (queued + active) in the bounded query pool",
+    registry=_registry,
+)
+
+query_workers_busy = Gauge(
+    "feishu_bot_query_workers_busy",
+    "Number of query workers currently busy executing a task",
+    registry=_registry,
+)
+
+query_dropped_total = Counter(
+    "feishu_bot_query_dropped_total",
+    "Total queries dropped before execution (queue full or rate limited)",
+    ["reason"],
+    registry=_registry,
+)
+
+query_processed_total = Counter(
+    "feishu_bot_query_processed_total",
+    "Total queries successfully processed by the query pool",
+    registry=_registry,
+)
+
+query_queue_wait_seconds = Histogram(
+    "feishu_bot_query_queue_wait_seconds",
+    "Time a query waited in the queue before execution started",
+    registry=_registry,
+)
+
 # ========== HTTP Middleware ==========
 
 http_requests_total = Counter(
@@ -366,6 +399,14 @@ def init_metrics() -> None:
     rag_embed_errors_total.inc(0)
     rag_query_total.labels(query_type="list").inc(0)
     rag_query_total.labels(query_type="qa").inc(0)
+
+    # Query Executor
+    query_queue_depth.set(0)
+    query_workers_busy.set(0)
+    query_dropped_total.labels(reason="queue_full").inc(0)
+    query_dropped_total.labels(reason="rate_limited").inc(0)
+    query_processed_total.inc(0)
+    query_queue_wait_seconds.observe(0)
 
 
 def get_metrics_text() -> bytes:

@@ -4,19 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Feishu AI News Bot — a FastAPI + LangGraph multi-platform service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes rich messages to **Feishu (Lark)** and **Telegram**. Supports @Bot queries from within chat groups, with RAG-powered semantic search and AI-assisted Q&A.
+Feishu AI News Bot — a FastAPI + LangGraph multi-platform service that polls AI vendor news sources (Blog RSS + Twitter via Nitter) daily, summarizes articles via LLM, and pushes rich messages to **Feishu (Lark)**, **Telegram**, and **Discord**. Supports @Bot queries from within chat groups, with RAG-powered semantic search and AI-assisted Q&A.
 
-**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Multi-platform delivery (Feishu Interactive Cards + Telegram Markdown/InlineKeyboard). Dynamic chat discovery via Feishu WebSocket + Telegram Webhook. Per-chat vendor subscriptions with push time & frequency customization. Group owner/admin permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek). RAG intelligent Q&A — semantic search (ChromaDB + OpenAI embeddings) with LLM-generated answers with citations. Intent routing: auto-classifies queries as "list search" vs "natural language Q&A".
+**Features:** 10 sources across 6 vendors (Blog RSS + Twitter via Nitter). Multi-platform delivery (Feishu Interactive Cards + Telegram Markdown/InlineKeyboard + Discord Embed/Button). Dynamic chat discovery via Feishu WebSocket + Telegram Webhook + Discord Gateway. Per-chat vendor subscriptions with push time & frequency customization. Group owner/admin permission control. Multi-LLM support (OpenAI / Anthropic / DeepSeek). RAG intelligent Q&A — semantic search (ChromaDB + OpenAI embeddings) with LLM-generated answers with citations. Intent routing: auto-classifies queries as "list search" vs "natural language Q&A".
 
 **Scheduling:** Articles are fetched and summarized at 5:00 AM daily, then delivered at 9:00 / 12:00 / 18:00 based on each chat's time preference. Multi-layer push filtering: push_time → frequency (daily/weekdays/weekly) → vendor subscription. Delivery is platform-aware — each chat gets messages rendered in its native format.
 
 **Event receiving:**
 - **Feishu:** WebSocket long connection via `lark-oapi` SDK — no public URL or webhook needed. Events handled in a daemon thread with independent asyncio event loop.
 - **Telegram:** Webhook via `python-telegram-bot` — FastAPI route at `/webhook/telegram` receives Update objects. `my_chat_member` events auto-register groups.
+- **Discord:** Gateway via `discord.py` — daemon thread with independent asyncio loop (no public URL). `@Bot` mention messages / button interactions / guild lifecycle events drive onboarding. Business logic offloaded to a `ThreadPoolExecutor(max_workers=5)` so the gateway loop never blocks on LLM calls.
 
 FastAPI serves `/health`, `/metrics`, `/admin/*`, and the Telegram webhook endpoint.
 
-**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (42 counters/gauges/histograms across HTTP, LLM, Feishu API, Telegram API, Pipeline, CircuitBreaker, WebSocket, RAG), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
+**Observability:** Structured JSON logging (`python-json-logger`), Prometheus metrics (30 metric families across HTTP, LLM, Feishu API, Telegram API, Pipeline, CircuitBreaker, WebSocket, RAG, Query pool), Grafana dashboard (8-row pre-built dashboard). Full monitoring stack via `docker-compose` (Prometheus + Grafana).
 
 **Tech Stack:** Python 3.10+, FastAPI, LangGraph, LangChain Core, Pydantic v2, SQLAlchemy, Redis-py, APScheduler, lark-oapi, python-telegram-bot, Trafilatura, feedparser, httpx, ChromaDB, OpenAI embeddings, Pytest, Docker, Prometheus, Grafana.
 
@@ -40,17 +41,20 @@ FastAPI serves `/health`, `/metrics`, `/admin/*`, and the Telegram webhook endpo
 | **Registry (isolated)** | `app/core/metrics.py` | `CollectorRegistry()` singleton — metrics isolated from global Prometheus registry |
 | **Strategy (intent routing)** | `app/graph/nodes/intent_router.py` | LLM classification + keyword heuristic fallback: list vs qa routing |
 
-**Concurrency Model:** 4-thread architecture — FastAPI main (uvicorn asyncio), Feishu WS daemon (isolated event loop), Event worker pool (ThreadPoolExecutor), Telegram webhook (FastAPI route, synchronous by default). Shared state via MySQL/Redis/TTL Cache (threading.Lock). See `docs/concurrency-model.md` for full analysis.
+**Concurrency Model:** Unified bounded query pool — `app/core/query_executor.py` (shared `ThreadPoolExecutor` + `BoundedSemaphore` + per-user rate limit). All three platforms dispatch into it and **never block their event loops**: Feishu WS thread / Discord gateway thread / Telegram webhook (FastAPI route) each just `submit()` and return. Overload policy: queue full → drop + platform layer replies a "系统繁忙" message; per-user rate limit (QUERY_RATE_LIMIT_SECONDS) prevents spam. Config: `QUERY_MAX_WORKERS=10`, `QUERY_MAX_QUEUE=50`, `QUERY_QUEUE_TIMEOUT_SECONDS=0.5`, `QUERY_RATE_LIMIT_SECONDS=2.0`. Observability: `query_queue_depth` / `query_workers_busy` / `query_dropped_total` / `query_processed_total` / `query_queue_wait_seconds`. Shared state via MySQL/Redis/TTL Cache (threading.Lock); ChromaDB lazy-init is double-check-locked (`vector_store.py`). See `docs/concurrency-model.md` for full analysis.
 
 **Architecture Decisions:** 9 ADRs in `docs/adr/` covering WebSocket choice, two-phase pipeline, WS thread isolation, LangGraph workflow, soft-delete, thread-pool-over-asyncio, observability stack, RAG upgrade, and multi-platform adapter.
 
-**Database Migrations:** Lightweight auto-migration in `app/db/database.py:_run_migrations()` — detects missing columns on startup and applies ALTER TABLE. Safe, idempotent, no external migration framework needed.
+**Database Migrations:** Lightweight auto-migration in `app/db/database.py:_run_migrations()` — detects missing columns on startup and applies ALTER TABLE, then `_run_index_migrations()` does the same for indexes (via `inspector.get_indexes()`). Safe, idempotent, no external migration framework needed. Fresh databases get everything from `Base.metadata.create_all()`; the migration lists exist only for pre-existing databases, so any index added to `models.py` must also be added to `_INDEX_MIGRATIONS` (a test asserts the two stay in sync).
 
 ## Commands
 
 ```bash
-# Install
+# Install (development — floor constraints)
 python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+
+# Install (production — exact pins)
+pip install -r requirements-lock.txt
 
 # Run (requires MySQL + Redis)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -61,6 +65,15 @@ docker-compose up -d --build
 # Tests
 pytest -v
 ```
+
+**Dependency files:** `requirements.txt` holds `>=` floor constraints; `requirements-lock.txt` holds exact pins and **is committed** (it was previously gitignored while `requirements.txt` told production to install from it — a contradiction that left the lock file out of the repo entirely). Regenerate it **from the project venv, never from a conda base env** — a conda `pip freeze` emits `@ file:///C:/b/...` local build paths that cannot install anywhere else:
+
+```bash
+./venv/Scripts/python.exe -m pip install -r requirements.txt
+./venv/Scripts/python.exe -m pip freeze --exclude-editable > requirements-lock.txt
+```
+
+Add any new dependency to **both** files. `chromadb` and `discord.py` are required for the full test suite — without them 12 tests fail on import.
 
 ## Architecture
 
@@ -83,15 +96,16 @@ pytest -v
                                    │  implements
                     ┌──────────────┼───────────────┐
                     │              │               │
-              ┌─────▼─────┐ ┌──────▼──────┐
-              │  Feishu   │ │  Telegram   │  (Slack, Discord...)
-              │  Adapter  │ │  Adapter    │
-              └───────────┘ └─────────────┘
+              ┌─────▼─────┐ ┌──────▼──────┐ ┌──────▼──────┐
+              │  Feishu   │ │  Telegram   │ │  Discord    │  (Slack...)
+              │  Adapter  │ │  Adapter    │ │  Adapter    │
+              └───────────┘ └─────────────┘ └─────────────┘
 ```
 
 Core business logic operates on `RichMessage` (platform-agnostic). Each adapter renders it:
 - **Feishu:** `RichMessage` → Interactive Card JSON (lark_md elements + action buttons)
 - **Telegram:** `RichMessage` → HTML text + InlineKeyboardMarkup
+- **Discord:** `RichMessage` → Embed JSON + Button components
 
 The pattern mirrors the existing LLM Provider Factory (`app/llm/provider.py`).
 
@@ -105,11 +119,16 @@ app/platforms/
 ├── feishu/
 │   ├── adapter.py            # FeishuAdapter — wraps existing FeishuClient
 │   └── renderer.py           # RichMessage → Feishu Interactive Card JSON
-└── telegram/
-    ├── adapter.py            # TelegramAdapter — python-telegram-bot Bot instance
-    ├── renderer.py           # RichMessage → HTML + InlineKeyboardMarkup
-    ├── webhook.py            # FastAPI webhook endpoint (/webhook/telegram)
-    └── commands.py           # Command templates + vendor alias resolution
+├── telegram/
+│   ├── adapter.py            # TelegramAdapter — python-telegram-bot Bot instance
+│   ├── renderer.py           # RichMessage → HTML + InlineKeyboardMarkup
+│   ├── webhook.py            # FastAPI webhook endpoint (/webhook/telegram)
+│   └── commands.py           # Command templates + vendor alias resolution
+└── discord/
+    ├── adapter.py            # DiscordAdapter — discord.py client (gateway thread)
+    ├── renderer.py           # RichMessage → Discord Embed JSON + Button components
+    ├── gateway.py            # daemon thread + discord.py Client + worker pool + dedup
+    └── commands.py           # Discord-flavored welcome/help templates + vendor alias
 ```
 
 ### Data Model (Multi-Platform)
@@ -122,10 +141,28 @@ ChatPreference: platform | conversation_id | chat_id (compat) | push_time | freq
 ChatRegistry:   platform | conversation_id | chat_id (compat) | chat_type | owner_id | is_active
 ```
 
-- `platform` = `"feishu"` | `"telegram"` — which IM platform
-- `conversation_id` = platform-native chat/user ID (e.g., `oc_xxx` for Feishu, `-123456` for Telegram group)
+- `platform` = `"feishu"` | `"telegram"` | `"discord"` — which IM platform
+- `conversation_id` = platform-native chat/user ID (e.g., `oc_xxx` for Feishu, `-123456` for Telegram group, `1234567890` Discord channel snowflake)
 - `chat_id` = legacy compat column, set equal to `conversation_id` for existing data
 - All repository/facade functions accept optional `platform="feishu"` parameter (backward compatible)
+
+### Conversation Discovery (no static ID lists)
+
+**Conversation IDs are never pre-configured — every platform discovers them at runtime** and writes them into `chat_registry`. There is no "fill in your channel IDs" step for any platform.
+
+| Platform | Discovery trigger | Code path |
+|----------|-------------------|-----------|
+| Feishu | Bot added to group → `im.chat.member.bot.added_v1`; private chat → first message | `feishu/event_router.py` → `chat/lifecycle.register_chat()` |
+| Telegram | `my_chat_member` (bot added/removed); private chat → first `/start` or text | `platforms/telegram/webhook.py` → `main._auto_detect_and_register_telegram_chat()` |
+| Discord | `on_guild_join` / `on_ready` → `_pick_default_channel()`; **or** any channel where a user `@Bot`s | `platforms/discord/gateway.py:_onboard_guild()` → `main._auto_register_discord_channel()` |
+
+Discord specifics: `_pick_default_channel()` prefers `system_channel`, else the first text channel where the bot has `send_messages`. `on_ready` re-onboards existing guilds so a restart (or being invited while offline) still registers — `is_new_chat()` keeps it idempotent. Server channels register as `chat_type="group"` and auto-subscribe all vendors; DMs register as `"user"` without auto-subscription. `DISCORD_GUILD_ID` is **optional** — it only restricts onboarding to a single server, it is not an ID registry.
+
+Delivery is symmetric: `deliver_job()` queries `ChatRegistry` and groups by `platform`, so it picks up whatever was discovered without config changes.
+
+> `FEISHU_CHAT_IDS` in `.env.example` is the one remaining static list, and it is vestigial — only `graph/nodes/send_feishu.py:_resolve_targets_legacy()` still reads it. `deliver_job()` ignores it entirely.
+
+**Platform isolation invariant:** `get_active_chats()` / `get_active_chat_ids()` (`db/sql_repositories.py`) take `platform` (default `"feishu"`; pass `None` for a deliberate cross-platform scan, which also returns a `platform` field for routing). A conversation ID is only meaningful within its own platform — handing Discord channel snowflakes to `FeishuClient` yields nothing but failed sends, so any new call site must pass the platform it intends to send through.
 
 ### Scheduling (Two-Phase Pipeline)
 
@@ -215,9 +252,10 @@ Two LangGraph workflows drive the system:
 
 **Application Layer:**
 - `app/main.py` — FastAPI entry point, SOURCES config, APScheduler lifecycle (4 jobs), `/health`, `/metrics`, `/admin/*` endpoints, Telegram webhook setup + command/callback handlers
-- `app/core/config.py` — all config via `pydantic-settings` (env vars): Feishu, Telegram, LLM, MySQL, Redis, `LOG_LEVEL`
+- `app/core/config.py` — all config via `pydantic-settings` (env vars): Feishu, Telegram, Discord, LLM (incl. `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES`), MySQL, Redis, `LOG_LEVEL`, `ADMIN_API_TOKEN`, `QUERY_*` concurrency pool settings
+- `app/core/query_executor.py` — unified bounded query pool: `submit(fn, user_id=...) -> QuerySubmitStatus` (ACCEPTED/QUEUE_FULL/RATE_LIMITED), `BoundedSemaphore` backpressure, per-user rate limiting, Prometheus metrics; all platforms dispatch here
 - `app/core/logging_config.py` — structured JSON logging via `python-json-logger`, configurable `LOG_LEVEL`, suppresses noisy third-party libs
-- `app/core/metrics.py` — 36 Prometheus metrics (counters/gauges/histograms), decorator/context-manager instrumentation, isolated `CollectorRegistry`
+- `app/core/metrics.py` — 30 Prometheus metric families (counters/gauges/histograms), decorator/context-manager instrumentation, isolated `CollectorRegistry`
 - `app/core/security.py` — [已废弃] Feishu webhook 签名验证，WebSocket 模式无需验签
 
 **Platform Adapter Layer:**
@@ -239,6 +277,12 @@ Two LangGraph workflows drive the system:
 - `app/platforms/telegram/webhook.py` — FastAPI webhook endpoint + `my_chat_member` event for group lifecycle
 - `app/platforms/telegram/commands.py` — vendor alias resolution, welcome/help message templates
 
+**Discord Integration:**
+- `app/platforms/discord/adapter.py` — `DiscordAdapter` using `discord.py`; `send_message` dispatches onto the gateway loop via `asyncio.run_coroutine_threadsafe`; `is_admin()` checks `guild_permissions.administrator`/`manage_guild` via `fetch_member` (no Members Intent needed)
+- `app/platforms/discord/renderer.py` — `RichMessage` → Discord Embed dict (`color_hint`→embed color) + Button component specs (URL buttons / callback `custom_id`); pure functions, no SDK coupling
+- `app/platforms/discord/gateway.py` — daemon thread + `discord.Client` (independent asyncio loop); `@Bot` mention stripping, `on_interaction` button ack, guild join/remove onboarding, `OrderedDict` dedup; processing offloaded to `ThreadPoolExecutor(max_workers=5)` (Producer-Consumer, mirrors `feishu/event_router.py`)
+- `app/platforms/discord/commands.py` — Discord-flavored welcome/help templates + `resolve_vendor()` (reuses `subscription/handler.py` alias table)
+
 **RAG (Retrieval-Augmented Generation):**
 - `app/rag/embedder.py` — OpenAI `text-embedding-3-small` (1536-dim) via `openai.OpenAI` client, 3x retry, Prometheus metrics
 - `app/rag/vector_store.py` — ChromaDB `PersistentClient` (local `./chroma_data/`), CRUD operations: `add_article()`, `search()`, `delete_article()`, `collection_count()`
@@ -250,7 +294,7 @@ Two LangGraph workflows drive the system:
 - `app/fetcher/web_scraper.py` — article full-text extraction via Trafilatura (3x exponential backoff)
 
 **Storage:**
-- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle` (with `raw_content` column for RAG), `Subscription` (with `platform` + `conversation_id`), `ChatPreference` (with `platform` + `conversation_id`), `ChatRegistry` (with `platform` + `conversation_id`)
+- `app/db/models.py` — SQLAlchemy ORM: `NewsArticle` (with `raw_content` column for RAG), `Subscription` (with `platform` + `conversation_id`), `ChatPreference` (with `platform` + `conversation_id`), `ChatRegistry` (with `platform` + `conversation_id`). Indexes: `(platform, conversation_id)` on all three multi-platform tables (the primary lookup key — its leftmost prefix also covers plain `platform` lookups, so `platform` is not separately indexed), `(platform, is_active)` on `chat_registry` for the delivery scan, and `published_at` + `(vendor, published_at)` on `news_articles` for the delivery/search date-range filters
 - `app/db/database.py` — SQLAlchemy session factory + `_run_migrations()` auto-migration (12 migrations including multi-platform columns)
 - `app/db/redis.py` — URL dedup cache (Redis Set) + `tenant_access_token` cache
 - `app/db/repositories.py` — Repository ABC interfaces (`SubscriptionRepository`, `ChatRegistryRepository`) with `platform` parameters
@@ -258,7 +302,7 @@ Two LangGraph workflows drive the system:
 - `app/core/cache.py` — Thread-safe TTL memory cache (300s). Caches chat_type, owner_id, preferences (keys now scoped by `platform:chat_id`)
 
 **LLM:**
-- `app/llm/provider.py` — Factory for multi-provider LLM (OpenAI/Anthropic/DeepSeek), returns `BaseChatModel`
+- `app/llm/provider.py` — Factory for multi-provider LLM (OpenAI/Anthropic/DeepSeek), returns `BaseChatModel`. Always sets `timeout` + `max_retries` — LLM calls run on `query_executor` workers, and an unbounded hang would permanently consume one, silently draining the bounded pool while `/health` still reports OK
 - `app/prompts/loader.py` — YAML-based prompt template loader (`intent.yaml`, `summarize.yaml`, `rag_answer.yaml`)
 
 **Subscription & Chat Management:**
@@ -328,7 +372,25 @@ TELEGRAM_WEBHOOK_PATH=/webhook/telegram
 
 When `TELEGRAM_BOT_TOKEN` is empty, Telegram integration silently disables — Feishu continues working normally.
 
+### Discord Configuration
+
+```bash
+# .env
+DISCORD_BOT_TOKEN=your_bot_token_from_Developer_Portal
+# Optional: restrict onboarding to a single server
+DISCORD_GUILD_ID=
+```
+
+**Setup steps:**
+1. Create a bot at [Discord Developer Portal](https://discord.com/developers/applications) and copy its token.
+2. Enable the **Message Content Intent** (Bot → Privileged Gateway Intents) — required to read `@Bot` channel text.
+3. Invite the bot to your server with `applications.commands` + `bot` + `send_messages` scopes.
+
+When `DISCORD_BOT_TOKEN` is empty, Discord integration silently disables — Feishu continues working normally.
+
 ## Admin Endpoints
+
+**All `/admin/*` endpoints require authentication.** Requests must carry `X-Admin-Token: <ADMIN_API_TOKEN>`. The check is fail-closed: when `ADMIN_API_TOKEN` is unset the endpoints return `503` rather than running unauthenticated — they can trigger mass message delivery and batch embedding billing. Enforced by `verify_admin_token()` in `app/main.py` (constant-time compare via `secrets.compare_digest`).
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -336,6 +398,12 @@ When `TELEGRAM_BOT_TOKEN` is empty, Telegram integration silently disables — F
 | `/admin/trigger-push?time=09:00&limit=N` | POST | Manually trigger card delivery for a time slot |
 | `/admin/test-card?chat_id=xxx` | POST | Send a test card to verify button interactions |
 | `/admin/backfill-chromadb?max_articles=N` | POST | Backfill existing MySQL articles into ChromaDB |
+
+```bash
+curl -X POST http://localhost:8000/admin/trigger-rss -H "X-Admin-Token: $ADMIN_API_TOKEN"
+```
+
+`/health`, `/health/detailed`, `/metrics` and the Telegram webhook remain public.
 
 ## Data Sources
 
@@ -416,7 +484,7 @@ Commands (Chinese + English, detected via regex in `app/subscription/handler.py`
 
 This project follows **TDD** per the implementation plan in `implementation-plan.md`. The plan defines 7 sequential tasks, each requiring tests written first (`tests/`), then implementation, then `pytest -v` verification.
 
-All 7 tasks complete. RAG upgrade (+5 phases), query accuracy bug fixes, and multi-platform adapter (+6 phases) delivered. Current test suite: **247 tests passing** across 17 test files.
+All 7 tasks complete. RAG upgrade (+5 phases), query accuracy bug fixes, multi-platform adapter (+6 phases), Discord platform (+1 phase), and the unified bounded query pool delivered. Current test suite: **321 tests passing** across 19 test files.
 
 ## Monitoring Stack
 

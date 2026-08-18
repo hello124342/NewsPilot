@@ -10,8 +10,9 @@ FastAPI 提供健康检查、Prometheus 指标、管理接口和 APScheduler 调
 - APScheduler → 5:00 抓取存储 + 9:00/12:00/18:00 投递
 """
 import logging
+import secrets
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.core.config import Settings
@@ -162,11 +163,83 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Telegram not configured (TELEGRAM_BOT_TOKEN is empty), skipping")
 
+    # --- 启动 Discord 网关（如果已配置） ---
+    if settings.discord_configured:
+        from app.platforms.discord.gateway import (
+            configure as configure_discord_gateway,
+            start as start_discord_gateway,
+        )
+
+        def _on_discord_message(incoming):
+            """Discord 消息回调：自动注册 + 命令分派 + NL 查询"""
+            from app.graph.bot_query_graph import build_query_graph
+            incoming_text = incoming.text
+
+            # 自动检测频道类型并注册（首次消息时）
+            _auto_register_discord_channel(
+                incoming.chat_id,
+                is_dm=incoming.raw_payload.get("is_dm", False),
+            )
+
+            # help / start 关键词（Discord 无欢迎页，提供显式入口）
+            _normalized = incoming_text.strip().lower()
+            if _normalized in ("help", "帮助"):
+                _handle_discord_command(("help", None), incoming.chat_id, incoming.sender_id)
+                return
+            if _normalized in ("start", "开始"):
+                _handle_discord_command(("start", None), incoming.chat_id, incoming.sender_id)
+                return
+
+            # 先检查是否是订阅命令
+            from app.subscription.handler import detect_command
+            cmd = detect_command(incoming_text)
+            if cmd:
+                _handle_discord_command(cmd, incoming.chat_id, incoming.sender_id)
+                return
+
+            # NL 查询 → BotQueryGraph
+            state = {
+                "platform": "discord",
+                "user_id": incoming.sender_id,
+                "chat_id": incoming.chat_id,
+                "user_query": incoming_text,
+            }
+            try:
+                graph = build_query_graph()
+                graph.invoke(state)
+                logger.debug(f"Discord query processed: chat_id={incoming.chat_id}")
+            except Exception as e:
+                logger.error(f"Discord query failed: {e}")
+
+        def _on_discord_callback(callback_data, chat_id, sender_id):
+            """Discord 按钮回调：转发到订阅管理"""
+            _handle_discord_callback_action(callback_data, chat_id, sender_id)
+
+        configure_discord_gateway(
+            settings=settings,
+            on_message=_on_discord_message,
+            on_callback=_on_discord_callback,
+        )
+        discord_thread = start_discord_gateway()
+        _app_services["discord_thread"] = discord_thread
+        if discord_thread:
+            logger.info(f"Discord gateway started (thread: {discord_thread.name})")
+        else:
+            logger.warning(
+                "Discord gateway failed to start "
+                "(discord.py not installed or DISCORD_BOT_TOKEN missing)"
+            )
+    else:
+        logger.info("Discord not configured (DISCORD_BOT_TOKEN is empty), skipping")
+
     yield
     scheduler.shutdown()
     # 优雅关闭事件处理线程池（等待正在处理的请求完成）
     from app.feishu.event_router import shutdown_executor
     shutdown_executor(wait=True)
+    # 优雅关闭共享查询池
+    from app.core.query_executor import shutdown as query_shutdown
+    query_shutdown(wait=True)
     logger.info("Scheduler and event executor shut down (WS thread will exit as daemon)")
 
 
@@ -266,14 +339,33 @@ def _check_circuit_breaker() -> dict:
     return {"status": "healthy", **cb.status}
 
 
-@app.post("/admin/trigger-rss")
+# ========== 管理端点鉴权 ==========
+
+def verify_admin_token(x_admin_token: str = Header(default="")) -> None:
+    """校验 /admin/* 端点的访问令牌
+
+    这些端点可以触发全量群发消息和批量 embedding 计费，必须鉴权。
+    采用 fail-closed：未配置 ADMIN_API_TOKEN 时整体禁用，而不是放行。
+    """
+    settings = Settings()  # type: ignore[call-arg]
+    if not settings.admin_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin endpoints are disabled: ADMIN_API_TOKEN is not configured",
+        )
+    # 常量时间比较，避免通过响应耗时侧信道逐字节猜测令牌
+    if not secrets.compare_digest(x_admin_token, settings.ADMIN_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token")
+
+
+@app.post("/admin/trigger-rss", dependencies=[Depends(verify_admin_token)])
 async def trigger_rss():
     """手动触发 RSS 抓取（便于调试）"""
     result = process_rss_job()
     return JSONResponse(result)
 
 
-@app.post("/admin/backfill-chromadb")
+@app.post("/admin/backfill-chromadb", dependencies=[Depends(verify_admin_token)])
 async def backfill_chromadb(max_articles: int = 0):
     """回填已有文章到 ChromaDB 向量库
 
@@ -349,14 +441,14 @@ async def backfill_chromadb(max_articles: int = 0):
         db.close()
 
 
-@app.post("/admin/trigger-push")
+@app.post("/admin/trigger-push", dependencies=[Depends(verify_admin_token)])
 async def trigger_push(time: str = "09:00", limit: int = 0):
     """手动触发推送（便于调试）。limit=N 只发前 N 篇文章，默认 0=全部。"""
     result = deliver_job(time, limit=limit)
     return JSONResponse(result)
 
 
-@app.post("/admin/test-card")
+@app.post("/admin/test-card", dependencies=[Depends(verify_admin_token)])
 async def test_card(chat_id: str = ""):
     """发送一张测试卡片，验证按钮点击（便于调试）"""
     from app.feishu.card_builder import build_news_card
@@ -714,6 +806,283 @@ def _handle_telegram_callback_action(callback_data, chat_id: str, sender_id: str
             ))
         except Exception:
             pass
+
+
+def _handle_discord_command(cmd: tuple, channel_id: str, sender_id: str) -> None:
+    """处理 Discord 订阅命令（含权限校验）
+
+    Args:
+        cmd: detect_command 返回的 (action, vendor) 元组
+        channel_id: Discord channel_id
+        sender_id: Discord user_id
+    """
+    action, vendor = cmd
+    logger.info(f"Discord command: {action} {vendor}, channel={channel_id}, sender={sender_id}")
+
+    from app.platforms.registry import get_platform_adapter
+    from app.platforms.message_model import RichMessage
+    from app.platforms.discord.commands import (
+        resolve_vendor, build_welcome_message, build_help_message,
+    )
+
+    settings = Settings()  # type: ignore[call-arg]
+    adapter = get_platform_adapter("discord", settings)
+    if adapter is None:
+        logger.warning("Discord adapter not available")
+        return
+
+    PLATFORM = "discord"
+
+    # 权限检查：modify 操作仅服务器管理员/群主可执行
+    _modify_actions = {"subscribe", "unsubscribe", "set_time", "set_freq", "settings"}
+    if action in _modify_actions:
+        from app.chat.lifecycle import can_manage_subscription
+        if not can_manage_subscription(
+            channel_id, sender_id, platform=PLATFORM, platform_adapter=adapter
+        ):
+            try:
+                adapter.send_message(channel_id, RichMessage(
+                    title="⛔ 权限不足",
+                    body="只有**服务器管理员**可以修改本频道的订阅设置。\n\n@我 发送「订阅列表」查看当前订阅状态。",
+                    color_hint="warning",
+                ))
+            except Exception:
+                pass
+            return
+
+    try:
+        if action == "subscribe":
+            from app.subscription.handler import subscribe, ALL_VENDORS
+            if vendor == "__ALL__":
+                for v in ALL_VENDORS:
+                    subscribe(channel_id, v, platform=PLATFORM)
+                _ensure_chat_registered(channel_id, "group", PLATFORM)
+                adapter.send_message(channel_id, RichMessage(
+                    body=f"✅ 已订阅全部 {len(ALL_VENDORS)} 个厂商。",
+                    color_hint="success",
+                ))
+                return
+            resolved = resolve_vendor(vendor)
+            if resolved is None:
+                adapter.send_message(channel_id, RichMessage(
+                    body=f"❓ 未知厂商: {vendor}。\n可用: OpenAI, Anthropic, Google DeepMind, DeepSeek, Kimi (Moonshot), Z.ai / 智谱\n或 @我「订阅所有」。",
+                    color_hint="warning",
+                ))
+                return
+            _ensure_chat_registered(channel_id, "group", PLATFORM)
+            subscribe(channel_id, resolved, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"✅ 已订阅 **{resolved}**\n\n@我 发送「订阅列表」查看订阅。",
+                color_hint="success",
+            ))
+
+        elif action == "unsubscribe":
+            from app.subscription.handler import unsubscribe, ALL_VENDORS
+            if vendor == "__ALL__":
+                for v in ALL_VENDORS:
+                    unsubscribe(channel_id, v, platform=PLATFORM)
+                adapter.send_message(channel_id, RichMessage(
+                    body=f"🔕 已退订全部 {len(ALL_VENDORS)} 个厂商。",
+                    color_hint="info",
+                ))
+                return
+            resolved = resolve_vendor(vendor)
+            if resolved is None:
+                adapter.send_message(channel_id, RichMessage(
+                    body=f"❓ 未知厂商: {vendor}",
+                    color_hint="warning",
+                ))
+                return
+            _ensure_chat_registered(channel_id, "group", PLATFORM)
+            unsubscribe(channel_id, resolved, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"🔕 已退订 **{resolved}**\n\n@我 发送「订阅列表」查看订阅。",
+                color_hint="info",
+            ))
+
+        elif action == "list":
+            from app.subscription.handler import list_subscriptions
+            subs = list_subscriptions(channel_id, platform=PLATFORM)
+            if subs:
+                lines = "\n".join(f"  • {v}" for v in subs)
+                body = f"📋 **当前订阅了 {len(subs)} 个厂商：**\n\n{lines}"
+            else:
+                body = "⚠️ 尚未订阅任何厂商。\n@我 发送「订阅 OpenAI」开始订阅。"
+            adapter.send_message(channel_id, RichMessage(
+                title="📋 我的订阅", body=body, color_hint="info",
+            ))
+
+        elif action == "settings":
+            from app.subscription.handler import get_preference, PUSH_TIMES, FREQUENCIES
+            pref = get_preference(channel_id, platform=PLATFORM)
+            body = (
+                f"⏰ **推送时间：** {PUSH_TIMES.get(pref['push_time'], pref['push_time'])}\n"
+                f"📅 **推送频率：** {FREQUENCIES.get(pref['frequency'], pref['frequency'])}\n\n"
+                "@我 发送「设置推送时间 18:00」或「设置推送频率 工作日」修改"
+            )
+            adapter.send_message(channel_id, RichMessage(
+                title="⚙️ 推送设置", body=body, color_hint="info",
+            ))
+
+        elif action == "set_time":
+            from app.subscription.handler import set_push_time
+            # vendor param carries time value in cmd tuple
+            time_val = vendor
+            norm_time = f"{time_val}:00" if ":" not in time_val else time_val
+            if len(norm_time) == 4:
+                norm_time = f"0{norm_time}"
+            set_push_time(channel_id, norm_time, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"✅ 推送时间已设为 **{norm_time}**",
+                color_hint="success",
+            ))
+
+        elif action == "set_freq":
+            from app.subscription.handler import set_frequency
+            set_frequency(channel_id, vendor, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"✅ 推送频率已设为 **{vendor}**",
+                color_hint="success",
+            ))
+
+        elif action == "help":
+            adapter.send_message(channel_id, build_help_message())
+
+        elif action == "start":
+            _ensure_chat_registered(channel_id, "user", PLATFORM)
+            adapter.send_message(channel_id, build_welcome_message())
+
+        else:
+            adapter.send_message(channel_id, RichMessage(
+                body="❓ 未知命令。@我 发送「帮助」查看可用命令。",
+                color_hint="warning",
+            ))
+    except Exception as e:
+        logger.error(f"Discord command handler failed: {e}", exc_info=True)
+        try:
+            adapter.send_message(channel_id, RichMessage(
+                body="❌ 操作失败，请稍后再试。",
+                color_hint="warning",
+            ))
+        except Exception:
+            pass
+
+
+def _handle_discord_callback_action(callback_data, channel_id: str, sender_id: str) -> None:
+    """处理 Discord 按钮回调（退订、设置等，含权限校验）"""
+    from app.platforms.registry import get_platform_adapter
+    from app.platforms.message_model import RichMessage
+
+    settings = Settings()  # type: ignore[call-arg]
+    adapter = get_platform_adapter("discord", settings)
+    if adapter is None:
+        return
+
+    PLATFORM = "discord"
+    action = callback_data.action
+
+    # 权限检查（modify 操作仅管理员可执行）
+    _modify_actions = {"unsubscribe", "subs:manage", "settings", "set_time", "set_freq"}
+    if action in _modify_actions:
+        from app.chat.lifecycle import can_manage_subscription
+        if not can_manage_subscription(
+            channel_id, sender_id, platform=PLATFORM, platform_adapter=adapter,
+        ):
+            try:
+                adapter.send_message(channel_id, RichMessage(
+                    body="⛔ 只有**服务器管理员**可以修改订阅设置。",
+                    color_hint="warning",
+                ))
+            except Exception:
+                pass
+            return
+
+    try:
+        if action == "unsubscribe":
+            vendor = callback_data.params.get("vendor", "")
+            if vendor:
+                from app.subscription.handler import unsubscribe
+                unsubscribe(channel_id, vendor, platform=PLATFORM)
+                adapter.send_message(channel_id, RichMessage(
+                    body=f"🔕 已退订 **{vendor}**\n\n@我 发送「订阅列表」查看订阅。",
+                    color_hint="info",
+                ))
+
+        elif action in ("subs:manage", "list"):
+            from app.subscription.handler import list_subscriptions
+            subs = list_subscriptions(channel_id, platform=PLATFORM)
+            if subs:
+                lines = "\n".join(f"  • {v}" for v in subs)
+                body = f"📋 **当前订阅了 {len(subs)} 个厂商：**\n\n{lines}"
+            else:
+                body = "⚠️ 尚未订阅任何厂商。"
+            adapter.send_message(channel_id, RichMessage(
+                title="📋 我的订阅", body=body, color_hint="info",
+            ))
+
+        elif action == "settings":
+            from app.subscription.handler import get_preference, PUSH_TIMES, FREQUENCIES
+            pref = get_preference(channel_id, platform=PLATFORM)
+            body = (
+                f"⏰ **推送时间：** {PUSH_TIMES.get(pref['push_time'], pref['push_time'])}\n"
+                f"📅 **推送频率：** {FREQUENCIES.get(pref['frequency'], pref['frequency'])}\n\n"
+                "@我 发送「设置推送时间 18:00」或「设置推送频率 工作日」修改"
+            )
+            adapter.send_message(channel_id, RichMessage(
+                title="⚙️ 推送设置", body=body, color_hint="info",
+            ))
+
+        elif action == "set_time":
+            time_val = callback_data.params.get("time", "09:00")
+            from app.subscription.handler import set_push_time
+            set_push_time(channel_id, time_val, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"✅ 推送时间已设为 **{time_val}**",
+                color_hint="success",
+            ))
+
+        elif action == "set_freq":
+            freq = callback_data.params.get("freq", "daily")
+            from app.subscription.handler import set_frequency
+            set_frequency(channel_id, freq, platform=PLATFORM)
+            adapter.send_message(channel_id, RichMessage(
+                body=f"✅ 推送频率已设为 **{freq}**",
+                color_hint="success",
+            ))
+
+        else:
+            logger.debug(f"Unhandled Discord callback action: {action}, params={callback_data.params}")
+    except Exception as e:
+        logger.error(f"Discord callback handler failed: {e}", exc_info=True)
+        try:
+            adapter.send_message(channel_id, RichMessage(
+                body="❌ 操作失败，请稍后再试。",
+                color_hint="warning",
+            ))
+        except Exception:
+            pass
+
+
+def _auto_register_discord_channel(channel_id: str, is_dm: bool = False) -> None:
+    """自动注册 Discord 频道（首次消息时触发）
+
+    服务器文字频道 → 群聊（group），自动订阅全部厂商；
+    私聊 DM → 用户（user）。
+    """
+    from app.chat.lifecycle import is_new_chat, register_chat
+    from app.subscription.handler import subscribe, ALL_VENDORS
+
+    if not is_new_chat(channel_id, platform="discord"):
+        return
+
+    chat_type = "user" if is_dm else "group"
+    register_chat(channel_id, chat_type=chat_type, platform="discord")
+    logger.info(f"Discord channel auto-registered: {channel_id} ({chat_type})")
+
+    if not is_dm:
+        for v in ALL_VENDORS:
+            subscribe(channel_id, v, platform="discord")
+        logger.info(f"Discord channel auto-subscribed all vendors: {channel_id}")
 
 
 def _auto_detect_and_register_telegram_chat(chat_id: str) -> None:

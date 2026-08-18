@@ -31,12 +31,12 @@ def is_new_chat(chat_id: str, platform: str = "feishu") -> bool:
     return get_chat_repo().is_new(chat_id, platform=platform)
 
 
-def get_active_chats() -> list[dict]:
-    return get_chat_repo().get_active_chats()
+def get_active_chats(platform: str | None = "feishu") -> list[dict]:
+    return get_chat_repo().get_active_chats(platform=platform)
 
 
-def get_active_chat_ids() -> list[str]:
-    return get_chat_repo().get_active_chat_ids()
+def get_active_chat_ids(platform: str | None = "feishu") -> list[str]:
+    return get_chat_repo().get_active_chat_ids(platform=platform)
 
 
 def get_chat_type(chat_id: str, db: Session | None = None,
@@ -85,8 +85,8 @@ def can_manage_subscription(
     if chat_type is None:
         return True
 
-    # Telegram: 使用 platform_adapter.is_admin()
-    if platform == "telegram" and platform_adapter:
+    # Telegram / Discord: 使用 platform_adapter.is_admin()
+    if platform in ("telegram", "discord") and platform_adapter:
         try:
             return platform_adapter.is_admin(chat_id, sender_id)
         except Exception:

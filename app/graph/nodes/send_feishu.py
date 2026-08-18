@@ -30,7 +30,8 @@ def _resolve_targets(vendor: str) -> list[str]:
     """
     from app.chat.lifecycle import get_active_chat_ids
 
-    active_chats = get_active_chat_ids()
+    # 只取飞书会话：本节点用 FeishuClient 发送，Discord/Telegram 的会话 ID 在这里是无效目标
+    active_chats = get_active_chat_ids(platform="feishu")
     if not active_chats:
         return []
 
@@ -55,8 +56,8 @@ def _resolve_targets_legacy(vendor: str, configured_chats: list[str]) -> list[st
     """向后兼容：同时支持 FEISHU_CHAT_IDS + chat_registry"""
     from app.chat.lifecycle import get_active_chat_ids
 
-    # 合并 env 配置和自动发现的 chat
-    all_chats = list(set(configured_chats) | set(get_active_chat_ids()))
+    # 合并 env 配置和自动发现的 chat（同样只取飞书侧）
+    all_chats = list(set(configured_chats) | set(get_active_chat_ids(platform="feishu")))
     if not all_chats:
         return []
 

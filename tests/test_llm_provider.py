@@ -103,3 +103,59 @@ class TestLlmProvider:
         llm2 = get_llm(settings2)
         # ChatAnthropic 的模型字段名是 model 而非 model_name
         assert llm2.model == "claude-sonnet-4-6"
+
+
+class TestLlmTimeout:
+    """LLM 超时与重试上限测试
+
+    LLM 调用运行在 query_executor 的 worker 线程中。无超时的挂起调用会永久占用
+    worker，逐个耗尽后所有用户只能收到「系统繁忙」，而进程与 /health 仍显示正常。
+    因此超时必须被显式设置，这是有界查询池能成立的前提。
+    """
+
+    def test_openai_has_timeout_and_retries(self):
+        from app.core.config import Settings
+        from app.llm.provider import get_llm
+
+        llm = get_llm(Settings(LLM_PROVIDER="openai", OPENAI_API_KEY="sk-test"))
+        # langchain-openai 的字段名是 request_timeout（timeout 是其别名）
+        assert llm.request_timeout == 60.0
+        assert llm.max_retries == 2
+
+    def test_anthropic_has_timeout_and_retries(self):
+        from app.core.config import Settings
+        from app.llm.provider import get_llm
+
+        llm = get_llm(Settings(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="sk-ant-test"))
+        # langchain-anthropic 的字段名是 default_request_timeout
+        assert llm.default_request_timeout == 60.0
+        assert llm.max_retries == 2
+
+    def test_deepseek_has_timeout_and_retries(self):
+        from app.core.config import Settings
+        from app.llm.provider import get_llm
+
+        llm = get_llm(Settings(LLM_PROVIDER="deepseek", DEEPSEEK_API_KEY="sk-ds-test"))
+        assert llm.request_timeout == 60.0
+        assert llm.max_retries == 2
+
+    def test_timeout_is_configurable(self):
+        from app.core.config import Settings
+        from app.llm.provider import get_llm
+
+        llm = get_llm(Settings(
+            LLM_PROVIDER="openai",
+            OPENAI_API_KEY="sk-test",
+            LLM_TIMEOUT_SECONDS=15.0,
+            LLM_MAX_RETRIES=0,
+        ))
+        assert llm.request_timeout == 15.0
+        assert llm.max_retries == 0
+
+    def test_embedding_client_bounded(self):
+        """embedder 的 OpenAI 客户端必须有超时；重试交给 tenacity，避免两层相乘"""
+        from app.rag.embedder import _get_openai_client
+
+        client = _get_openai_client()
+        assert client.timeout == 60.0
+        assert client.max_retries == 0

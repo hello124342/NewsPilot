@@ -208,3 +208,69 @@ class TestRedisClient:
         # 触发连接
         _ = client.is_url_processed("test")
         mock_redis.assert_called_with(host="redis.local", port=6380, decode_responses=True)
+
+
+class TestIndexes:
+    """索引测试
+
+    (platform, conversation_id) 是多平台改造后的主查询键，此前完全没有索引；
+    news_articles 按 published_at 过滤+倒序，同样缺索引 —— 数据量上来后都是全表扫描。
+    """
+
+    @pytest.fixture
+    def inspector(self):
+        from sqlalchemy import create_engine, inspect
+        from app.db.models import Base
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)
+        return inspect(engine)
+
+    def _index_columns(self, inspector, table: str) -> list[list[str]]:
+        return [idx["column_names"] for idx in inspector.get_indexes(table)]
+
+    @pytest.mark.parametrize("table", ["subscriptions", "chat_preferences", "chat_registry"])
+    def test_platform_conversation_composite_index(self, inspector, table):
+        """三张多平台表都有 (platform, conversation_id) 复合索引"""
+        assert ["platform", "conversation_id"] in self._index_columns(inspector, table)
+
+    def test_news_articles_published_at_indexed(self, inspector):
+        """deliver_job / search_db 按 published_at 过滤排序"""
+        cols = self._index_columns(inspector, "news_articles")
+        assert ["published_at"] in cols
+        assert ["vendor", "published_at"] in cols
+
+    def test_chat_registry_active_scan_index(self, inspector):
+        """推送时按 (platform, is_active) 扫描全部活跃会话"""
+        assert ["platform", "is_active"] in self._index_columns(inspector, "chat_registry")
+
+    def test_index_migrations_cover_all_model_indexes(self):
+        """存量库靠 _INDEX_MIGRATIONS 补齐，必须与模型定义的索引一一对应"""
+        from app.db.database import _INDEX_MIGRATIONS
+        from app.db.models import Base
+
+        model_indexes = {
+            idx.name
+            for table in Base.metadata.tables.values()
+            for idx in table.indexes
+            if idx.name.endswith(("_platform_conv", "_platform_active", "_published_at", "_vendor_published"))
+        }
+        migration_indexes = {m["index"] for m in _INDEX_MIGRATIONS}
+        assert model_indexes == migration_indexes
+
+    def test_index_migrations_are_idempotent(self):
+        """索引已存在时跳过，不重复执行 CREATE INDEX"""
+        from sqlalchemy import create_engine, inspect
+        from app.db.models import Base
+        import app.db.database as database
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)  # 建表时索引已随之创建
+
+        with patch.object(database, "engine", engine):
+            # 不抛异常即为通过；所有索引都应被识别为已存在
+            database._run_index_migrations(inspect(engine))
+
+        # 索引数量未因重复执行而变化
+        after = {idx["name"] for idx in inspect(engine).get_indexes("chat_registry")}
+        assert "ix_chat_registry_platform_conv" in after
