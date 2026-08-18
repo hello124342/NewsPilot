@@ -46,6 +46,9 @@ lark-oapi==1.5.5
 # Telegram Bot SDK
 python-telegram-bot>=21.0
 
+# Discord Bot SDK（网关模式，无需公网 URL）
+discord.py>=2.3.0
+
 # 可观测性
 prometheus_client>=0.21.0
 python-json-logger>=2.0.0

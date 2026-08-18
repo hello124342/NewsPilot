@@ -479,22 +479,39 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         finally:
             db.close()
 
-    def get_active_chats(self) -> list[dict]:
+    def get_active_chats(self, platform: str | None = "feishu") -> list[dict]:
+        """获取活跃 chat 列表
+
+        Args:
+            platform: 限定平台；None 表示不限（跨平台调用方需自行按 platform 分流）
+
+        必须按平台过滤：会话 ID 只在本平台内有意义，把 Discord 频道 ID
+        交给 FeishuClient 发送只会得到一串无效目标。
+        """
         if SessionLocal is None:
             return []
 
         db = SessionLocal()
         try:
-            entries = db.query(ChatRegistry).filter_by(is_active=True).all()
-            return [{"chat_id": e.chat_id, "chat_type": e.chat_type} for e in entries]
+            query = db.query(ChatRegistry).filter(ChatRegistry.is_active == True)
+            if platform is not None:
+                query = query.filter(ChatRegistry.platform == platform)
+            return [
+                {
+                    "chat_id": e.conversation_id or e.chat_id,
+                    "chat_type": e.chat_type,
+                    "platform": e.platform or "feishu",
+                }
+                for e in query.all()
+            ]
         except Exception as e:
             logger.error(f"get_active_chats failed: {e}")
             return []
         finally:
             db.close()
 
-    def get_active_chat_ids(self) -> list[str]:
-        return [c["chat_id"] for c in self.get_active_chats()]
+    def get_active_chat_ids(self, platform: str | None = "feishu") -> list[str]:
+        return [c["chat_id"] for c in self.get_active_chats(platform=platform)]
 
     def get_type(self, chat_id: str, db: Session | None = None,
                  platform: str = "feishu") -> str | None:
@@ -602,8 +619,8 @@ class SqlChatRegistryRepository(ChatRegistryRepository):
         if chat_type is None:
             return True
 
-        # Telegram: 使用 platform_adapter.is_admin()
-        if platform == "telegram" and platform_adapter:
+        # Telegram / Discord: 使用 platform_adapter.is_admin()
+        if platform in ("telegram", "discord") and platform_adapter:
             try:
                 return platform_adapter.is_admin(chat_id, sender_id)
             except Exception:

@@ -115,13 +115,13 @@ class ChatRegistryRepository(ABC):
         ...
 
     @abstractmethod
-    def get_active_chats(self) -> list[dict]:
-        """获取所有活跃 chat 列表（含 platform 字段）"""
+    def get_active_chats(self, platform: str | None = "feishu") -> list[dict]:
+        """获取活跃 chat 列表（含 platform 字段）；platform=None 表示不限平台"""
         ...
 
     @abstractmethod
-    def get_active_chat_ids(self) -> list[str]:
-        """获取所有活跃 chat_id 列表"""
+    def get_active_chat_ids(self, platform: str | None = "feishu") -> list[str]:
+        """获取活跃 chat_id 列表；platform=None 表示不限平台"""
         ...
 
     @abstractmethod

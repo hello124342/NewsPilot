@@ -627,14 +627,69 @@ class TestChatLifecycle:
         from app.chat.lifecycle import get_active_chat_ids
 
         e1, e2 = MagicMock(), MagicMock()
-        e1.chat_id, e2.chat_id = "chat_001", "chat_002"
+        e1.conversation_id, e2.conversation_id = "chat_001", "chat_002"
         e1.chat_type, e2.chat_type = "group", "user"
+        e1.platform = e2.platform = "feishu"
         mock_db = MagicMock()
-        mock_db.query().filter_by().all.return_value = [e1, e2]
+        mock_db.query().filter().filter().all.return_value = [e1, e2]
         mock_session.return_value = mock_db
 
         ids = get_active_chat_ids()
         assert ids == ["chat_001", "chat_002"]
+
+    def test_get_active_chats_filters_by_platform(self):
+        """活跃会话必须按平台隔离
+
+        历史缺陷：get_active_chats 不带 platform 过滤，send_feishu 节点会把
+        Discord 频道 ID / Telegram chat ID 一并取出交给 FeishuClient 发送。
+        """
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.db.models import Base, ChatRegistry
+        import app.db.sql_repositories as repo_mod
+        from app.db.sql_repositories import SqlChatRegistryRepository
+
+        engine = create_engine("sqlite:///:memory:", echo=False)
+        Base.metadata.create_all(engine)
+        SessionFactory = sessionmaker(bind=engine)
+
+        db = SessionFactory()
+        for platform, conv in [
+            ("feishu", "oc_feishu_1"),
+            ("feishu", "oc_feishu_2"),
+            ("discord", "555000111"),
+            ("telegram", "-100200300"),
+        ]:
+            db.add(ChatRegistry(platform=platform, conversation_id=conv,
+                                chat_id=conv, chat_type="group", is_active=True))
+        # 非活跃会话不应出现在任何平台的结果里
+        db.add(ChatRegistry(platform="feishu", conversation_id="oc_dead",
+                            chat_id="oc_dead", chat_type="group", is_active=False))
+        db.commit()
+        db.close()
+
+        with patch.object(repo_mod, "SessionLocal", SessionFactory):
+            repo = SqlChatRegistryRepository()
+            assert sorted(repo.get_active_chat_ids(platform="feishu")) == [
+                "oc_feishu_1", "oc_feishu_2"
+            ]
+            assert repo.get_active_chat_ids(platform="discord") == ["555000111"]
+            assert repo.get_active_chat_ids(platform="telegram") == ["-100200300"]
+            # platform=None 显式跨平台，且带回 platform 字段供调用方分流
+            all_chats = repo.get_active_chats(platform=None)
+            assert len(all_chats) == 4
+            assert {c["platform"] for c in all_chats} == {"feishu", "discord", "telegram"}
+
+    def test_send_feishu_targets_exclude_other_platforms(self):
+        """send_feishu 节点只应拿到飞书会话"""
+        from app.graph.nodes import send_feishu
+
+        with patch("app.chat.lifecycle.get_active_chat_ids") as mock_ids, \
+             patch.object(send_feishu, "get_subscribers", return_value=[]), \
+             patch.object(send_feishu, "has_any_subscription", return_value=False):
+            mock_ids.return_value = ["oc_feishu_1"]
+            send_feishu._resolve_targets("OpenAI")
+            mock_ids.assert_called_once_with(platform="feishu")
 
 
 class TestPermissions:

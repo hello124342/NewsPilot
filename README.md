@@ -8,15 +8,15 @@
 <p align="center">
   <strong>Multi-Platform AI News Aggregator & Intelligent Q&A Bot</strong>
   <br>
-  多平台 AI 资讯聚合 · 智能问答机器人 · <b>Feishu</b> + <b>Telegram</b>
+  多平台 AI 资讯聚合 · 智能问答机器人 · <b>Feishu</b> + <b>Telegram</b> + <b>Discord</b>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.115+-009688.svg" alt="FastAPI"></a>
-  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-247%20passed-brightgreen.svg" alt="Tests"></a>
+  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-321%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
-  <a href="https://github.com/hello124342/aiNewBot"><img src="https://img.shields.io/badge/platform-Feishu_%7C_Telegram-5865F2.svg" alt="Platforms"></a>
+  <a href="https://github.com/hello124342/aiNewBot"><img src="https://img.shields.io/badge/platform-Feishu_%7C_Telegram_%7C_Discord-5865F2.svg" alt="Platforms"></a>
   <a href="#"><img src="https://img.shields.io/badge/coverage-90%25-brightgreen.svg" alt="Coverage"></a>
 </p>
 
@@ -55,10 +55,10 @@
 
 ### 📊 Production Ready
 - **Grafana dashboard** — 8-row pre-built monitoring
-- **Prometheus metrics** — 42 counters/gauges/histograms
+- **Prometheus metrics** — 30 metric families (incl. query-pool saturation)
 - **Structured logging** — JSON format, configurable `LOG_LEVEL`
 - **Circuit Breaker** — 3-state protection for external APIs
-- **247 tests** — 17 test files, TDD workflow
+- **321 tests** — 19 test files, TDD workflow
 
 </td></tr>
 </table>
@@ -132,8 +132,8 @@ adapter.send_message(chat_id, RichMessage(
 |---------|---------------|-----------------|
 | `FeishuAdapter` | Interactive Card JSON (`lark_md`) | WebSocket (lark-oapi SDK) |
 | `TelegramAdapter` | HTML + InlineKeyboardMarkup | Webhook (FastAPI route) |
+| `DiscordAdapter` | Embed JSON + Button components | Gateway (discord.py, daemon thread) |
 | *Slack (planned)* | Block Kit JSON | Socket Mode |
-| *Discord (planned)* | Embed JSON | Gateway |
 
 ### 🧵 Design Patterns
 
@@ -158,7 +158,7 @@ adapter.send_message(chat_id, RichMessage(
 
 - Python 3.10+
 - MySQL 8.0+ & Redis 6.0+
-- Feishu App credentials ([Open Platform](https://open.feishu.cn/)) or Telegram Bot Token ([@BotFather](https://t.me/BotFather))
+- Feishu App credentials ([Open Platform](https://open.feishu.cn/)) · Telegram Bot Token ([@BotFather](https://t.me/BotFather)) · or Discord Bot ([Developer Portal](https://discord.com/developers/applications))
 
 ### 1. Clone & Configure
 
@@ -175,16 +175,24 @@ FEISHU_APP_SECRET=xxx              # 飞书 App Secret
 
 TELEGRAM_BOT_TOKEN=123456:ABCdef   # Telegram Bot Token
 
+DISCORD_BOT_TOKEN=xxx               # Discord Bot Token (enable Message Content Intent)
+
 # ── LLM ──
 LLM_PROVIDER=openai                # openai | anthropic | deepseek
 OPENAI_API_KEY=sk-xxx
+LLM_TIMEOUT_SECONDS=60             # 单次调用超时，防止挂起的调用占满查询池
+
+# ── Admin API ──
+ADMIN_API_TOKEN=                   # /admin/* 访问令牌，留空则管理端点禁用
 
 # ── Database ──
 MYSQL_HOST=localhost
 REDIS_HOST=localhost
 ```
 
-> **Note:** Both platforms are optional — the bot works with just Feishu, just Telegram, or both. Unconfigured platforms silently disable.
+> **Note:** All three platforms are optional — the bot works with any subset. Unconfigured platforms silently disable.
+
+> **Security:** `/admin/*` endpoints can trigger mass delivery and batch embedding billing. They require an `X-Admin-Token` header matching `ADMIN_API_TOKEN`, and are **disabled entirely** (HTTP 503) when that value is unset. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 
 ### 2. Docker (Recommended)
 
@@ -196,16 +204,24 @@ docker-compose up -d --build
 ### 3. Local Development
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt          # floor constraints (>=)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+For reproducible/production installs use the committed lock file instead:
+
+```bash
+pip install -r requirements-lock.txt     # exact pins
+```
+
+> **Regenerating the lock file:** run `pip freeze` **inside the project venv**, not a conda base environment — conda emits `@ file:///...` local build paths that fail to install anywhere else. See [CLAUDE.md](./CLAUDE.md#commands).
 
 ### 4. Verify
 
 ```bash
 curl http://localhost:8000/health          # → {"status": "ok"}
 curl http://localhost:8000/metrics         # → Prometheus metrics
-pytest -v                                  # → 247 passed
+pytest -v                                  # → 321 passed
 ```
 
 ---
@@ -239,6 +255,26 @@ pytest -v                                  # → 247 passed
 | Help | `/help` |
 | News search | `OpenAI 最近有什么新闻` (plain text) |
 | RAG Q&A | `GPT-5 什么时候发布？` (plain text) |
+
+### Discord
+
+Messages must **@mention the bot** to be processed.
+
+| Action | Example |
+|--------|---------|
+| Welcome / Help | `@Bot 开始` or `@Bot 帮助` |
+| Subscribe | `@Bot 订阅 OpenAI` or `@Bot 订阅所有` |
+| Unsubscribe | `@Bot 退订 DeepSeek` |
+| List subscriptions | `@Bot 订阅列表` |
+| Push settings | `@Bot 设置` |
+| Set push time | `@Bot 设置推送时间 18:00` |
+| Set frequency | `@Bot 设置推送频率 工作日` |
+| News search | `@Bot OpenAI 最近有什么新闻` |
+| RAG Q&A | `@Bot GPT-5 什么时候发布？` |
+
+> **Setup note:** enable the **Message Content Intent** in Discord Developer Portal (Bot → Privileged Gateway Intents) — required for the bot to read @mention text.
+
+> **Zero config:** you never fill in channel IDs. Inviting the bot to a server registers a default channel (`system_channel`, else the first channel it can post in) and auto-subscribes all vendors; `@`-mentioning it in any other channel registers that channel on the spot. `DISCORD_GUILD_ID` is optional and only limits onboarding to one server. The same holds for Feishu and Telegram — all conversation IDs are discovered at runtime.
 
 ### Supported Vendors
 
@@ -279,7 +315,8 @@ aiNewBot/
 │   │   ├── message_model.py     #   RichMessage, ActionButton, etc.
 │   │   ├── registry.py          #   get_platform_adapter() factory
 │   │   ├── feishu/              #   FeishuAdapter + Card renderer
-│   │   └── telegram/            #   TelegramAdapter + webhook + commands
+│   │   ├── telegram/            #   TelegramAdapter + webhook + commands
+│   │   └── discord/             #   DiscordAdapter + renderer + gateway
 │   ├── db/                      # SQLAlchemy models, Redis, Repository ABC+impl
 │   ├── feishu/                  # Feishu SDK client, card builders, WS event router
 │   ├── fetcher/                 # RSS parser, Kimi scraper, Trafilatura extractor
@@ -291,11 +328,12 @@ aiNewBot/
 ├── docs/
 │   ├── adr/                     # 9 Architecture Decision Records
 │   └── concurrency-model.md     # Thread model analysis
-├── tests/                       # 247 tests / 17 test files
+├── tests/                       # 321 tests / 19 test files
 ├── monitoring/                  # Prometheus & Grafana configs
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
+├── requirements-lock.txt        # exact pins (committed, for production)
 └── CLAUDE.md                    # AI coding guide
 ```
 
@@ -319,9 +357,10 @@ aiNewBot/
 ## 🧪 Testing
 
 ```bash
-pytest -v              # Full suite: 247 tests across 17 files
+pytest -v              # Full suite: 321 tests across 19 files
 pytest -v --tb=short   # Compact tracebacks
 pytest -v -k "telegram" # Run Telegram-specific tests only
+pytest -v -k "discord"  # Run Discord-specific tests only
 ```
 
 ---
