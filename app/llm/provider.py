@@ -2,6 +2,9 @@
 
 根据 Settings 配置返回对应厂商的 LangChain BaseChatModel 实例。
 支持 OpenAI、Anthropic Claude、DeepSeek（OpenAI 兼容接口）。
+
+所有实例均设置 timeout / max_retries：LLM 调用运行在 query_executor 的 worker
+线程中，无超时的挂起调用会永久占用 worker，最终耗尽整个有界查询池。
 """
 import logging
 from langchain_core.language_models import BaseChatModel
@@ -58,13 +61,30 @@ def get_llm(settings: Settings | None = None) -> BaseChatModel:
 
     # 优先使用用户指定的模型，未指定则用厂商默认
     model = settings.LLM_MODEL or _DEFAULT_MODELS[provider]
-    logger.info(f"LLM initialized: provider={provider}, model={model}")
+    timeout = settings.LLM_TIMEOUT_SECONDS
+    max_retries = settings.LLM_MAX_RETRIES
+    logger.info(
+        f"LLM initialized: provider={provider}, model={model}, "
+        f"timeout={timeout}s, max_retries={max_retries}"
+    )
 
     if provider == "openai":
-        return ChatOpenAI(model=model, api_key=api_key, temperature=0.5)
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            temperature=0.5,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
     if provider == "anthropic":
-        return ChatAnthropic(model=model, api_key=api_key, temperature=0.5)
+        return ChatAnthropic(
+            model=model,
+            api_key=api_key,
+            temperature=0.5,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
     if provider == "deepseek":
         return ChatOpenAI(
@@ -72,6 +92,8 @@ def get_llm(settings: Settings | None = None) -> BaseChatModel:
             api_key=api_key,
             base_url="https://api.deepseek.com/v1",
             temperature=0.5,
+            timeout=timeout,
+            max_retries=max_retries,
         )
 
     raise ValueError(f"Unhandled provider: {provider}")

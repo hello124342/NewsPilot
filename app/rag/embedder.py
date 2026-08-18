@@ -16,10 +16,19 @@ _MAX_CHARS_PER_BATCH = 8000
 
 
 def _get_openai_client():
-    """获取 OpenAI 客户端（延迟导入避免启动时无网络报错）"""
+    """获取 OpenAI 客户端（延迟导入避免启动时无网络报错）
+
+    必须显式设置 timeout：SDK 默认 600s，叠加下方 tenacity 3 次重试后，
+    单次 get_embedding 最坏可占用查询池 worker 半小时。
+    max_retries=0 是因为重试已由 tenacity 统一负责，避免两层重试相乘。
+    """
     from openai import OpenAI
     settings = Settings()  # type: ignore[call-arg]
-    return OpenAI(api_key=settings.OPENAI_API_KEY)
+    return OpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        timeout=settings.LLM_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
 
 
 def _emit_embed_metric(duration: float, success: bool) -> None:
