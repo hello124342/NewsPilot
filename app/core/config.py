@@ -27,12 +27,25 @@ class Settings(BaseSettings):
     TELEGRAM_WEBHOOK_PATH: str = "/webhook/telegram"
     TELEGRAM_WEBHOOK_SECRET: str = ""  # 可选，webhook 安全校验
 
+    # ========== Discord Bot 配置 ==========
+    DISCORD_BOT_TOKEN: str = ""
+    DISCORD_GUILD_ID: str = ""  # 可选：限定单服务器，便于选默认频道
+
     # ========== LLM 多厂商配置 ==========
     LLM_PROVIDER: Literal["openai", "anthropic", "deepseek"] = "openai"
     LLM_MODEL: str = ""  # 空字符串表示使用厂商默认模型
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     DEEPSEEK_API_KEY: str = ""
+    # 单次 LLM 调用超时（秒）。必须有界：查询池 worker 阻塞在无超时的调用上会永不释放，
+    # 耗尽 worker 后所有用户都只能收到「系统繁忙」，而进程和 /health 仍表现正常
+    LLM_TIMEOUT_SECONDS: float = 60.0
+    LLM_MAX_RETRIES: int = 2  # SDK 层重试次数（节点层另有自己的重试逻辑）
+
+    # ========== 管理接口配置 ==========
+    # /admin/* 端点的访问令牌。留空则管理端点整体禁用（fail-closed），
+    # 因为这些端点可触发群发消息和批量 embedding 计费
+    ADMIN_API_TOKEN: str = ""
 
     # ========== MySQL 配置 ==========
     MYSQL_HOST: str = "127.0.0.1"
@@ -40,6 +53,12 @@ class Settings(BaseSettings):
     MYSQL_USER: str = "root"
     MYSQL_PASSWORD: str = ""
     MYSQL_DATABASE: str = "lark_news"
+
+    # ========== 并发查询池配置 ==========
+    QUERY_MAX_WORKERS: int = 10  # 查询池 worker 数（LLM rate limit 是实际瓶颈）
+    QUERY_MAX_QUEUE: int = 50    # 有界队列容量，打满后丢弃新请求
+    QUERY_QUEUE_TIMEOUT_SECONDS: float = 0.5  # 等待队列空位的超时
+    QUERY_RATE_LIMIT_SECONDS: float = 2.0     # 每用户查询最小间隔（0=关闭限流）
 
     # ========== 可观测性配置 ==========
     LOG_LEVEL: str = "INFO"  # DEBUG | INFO | WARNING | ERROR
@@ -89,3 +108,13 @@ class Settings(BaseSettings):
     def telegram_configured(self) -> bool:
         """检查 Telegram 凭证是否已配置"""
         return bool(self.TELEGRAM_BOT_TOKEN.strip())
+
+    @property
+    def discord_configured(self) -> bool:
+        """检查 Discord 凭证是否已配置"""
+        return bool(self.DISCORD_BOT_TOKEN.strip())
+
+    @property
+    def admin_configured(self) -> bool:
+        """检查管理接口令牌是否已配置（未配置时 /admin/* 全部禁用）"""
+        return bool(self.ADMIN_API_TOKEN.strip())
