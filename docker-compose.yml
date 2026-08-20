@@ -20,6 +20,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      # RAG 向量库必须持久化:容器重建(部署新版本/up --build)后语义搜索索引不能丢
+      - chroma_data:/app/chroma_data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -103,3 +106,4 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  chroma_data:

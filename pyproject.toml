@@ -1,0 +1,13 @@
+# 工程配置
+# - pytest:默认启用覆盖率统计(--cov=app),每次运行都输出缺失行
+# - coverage:门槛由 CI 以 --cov-fail-under=50 强制(实测基线 54%,预留防回归缓冲);
+#   本地运行子集测试时不受此限制(否则单跑一个测试文件也会因覆盖率不足而失败)
+#
+# 说明:本文件当前只含 pytest + coverage 两段。
+# ruff/mypy/pre-commit 等代码质量工具属后续工程化阶段,落地后再追加相应配置段。
+
+[tool.pytest.ini_options]
+addopts = "--cov=app --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["app"]
