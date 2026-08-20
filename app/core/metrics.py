@@ -74,15 +74,15 @@ deliver_job_duration_seconds = Histogram(
 
 deliver_cards_sent_total = Counter(
     "feishu_bot_deliver_cards_sent_total",
-    "Total cards sent during deliver job",
-    ["push_time"],
+    "Total cards sent during deliver job, by push time and platform",
+    ["push_time", "platform"],
     registry=_registry,
 )
 
 deliver_errors_total = Counter(
     "feishu_bot_deliver_errors_total",
-    "Total errors during deliver job",
-    ["push_time"],
+    "Total errors during deliver job, by push time and platform",
+    ["push_time", "platform"],
     registry=_registry,
 )
 
@@ -130,6 +130,32 @@ feishu_api_errors_total = Counter(
     "feishu_bot_feishu_api_errors_total",
     "Feishu API call errors",
     ["method", "code"],
+    registry=_registry,
+)
+
+# ========== Platform Message Sends（多平台统一发送埋点）==========
+# 装饰各 PlatformAdapter 的 send_message，使 Feishu / Telegram / Discord
+# 的发送量、延迟、错误以统一的 platform 标签维度可观测。
+
+platform_message_sent_total = Counter(
+    "feishu_bot_platform_message_sent_total",
+    "Total messages successfully sent via platform adapters",
+    ["platform"],
+    registry=_registry,
+)
+
+platform_message_errors_total = Counter(
+    "feishu_bot_platform_message_errors_total",
+    "Total platform message send errors",
+    ["platform", "error_type"],
+    registry=_registry,
+)
+
+platform_message_duration_seconds = Histogram(
+    "feishu_bot_platform_message_duration_seconds",
+    "Platform message send latency in seconds",
+    ["platform"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
     registry=_registry,
 )
 
@@ -322,6 +348,39 @@ def track_feishu_api(method: str):
     return decorator
 
 
+def track_platform_send(platform: str):
+    """平台消息发送埋点 decorator，统一记录耗时、成功与错误。
+
+    装饰各 PlatformAdapter 的 send_message（均为同步方法）。
+    成功返回即记 sent_total；抛异常记 errors_total 后重新上抛（不吞异常）。
+
+    用法:
+        @track_platform_send("telegram")
+        def send_message(self, conversation_id, message):
+            ...
+    """
+    def decorator(func: Callable[..., dict]) -> Callable[..., dict]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> dict:
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = time.perf_counter() - start
+                platform_message_duration_seconds.labels(platform=platform).observe(elapsed)
+                platform_message_sent_total.labels(platform=platform).inc()
+                return result
+            except Exception as e:
+                elapsed = time.perf_counter() - start
+                platform_message_duration_seconds.labels(platform=platform).observe(elapsed)
+                platform_message_errors_total.labels(
+                    platform=platform,
+                    error_type=type(e).__name__,
+                ).inc()
+                raise
+        return wrapper
+    return decorator
+
+
 def track_job_metrics(job_type: str):
     """定时任务埋点 decorator，记录总耗时和成功/失败。
 
@@ -370,13 +429,11 @@ def init_metrics() -> None:
     rss_articles_processed_total.inc(0)
     rss_articles_skipped_total.inc(0)
 
-    # Deliver Job
-    deliver_cards_sent_total.labels(push_time="09:00").inc(0)
-    deliver_cards_sent_total.labels(push_time="12:00").inc(0)
-    deliver_cards_sent_total.labels(push_time="18:00").inc(0)
-    deliver_errors_total.labels(push_time="09:00").inc(0)
-    deliver_errors_total.labels(push_time="12:00").inc(0)
-    deliver_errors_total.labels(push_time="18:00").inc(0)
+    # Deliver Job（3 个推送时段 × 3 个平台）
+    for _pt in ("09:00", "12:00", "18:00"):
+        for _pf in ("feishu", "telegram", "discord"):
+            deliver_cards_sent_total.labels(push_time=_pt, platform=_pf).inc(0)
+            deliver_errors_total.labels(push_time=_pt, platform=_pf).inc(0)
 
     # WebSocket
     ws_connection_status.set(0)
@@ -407,6 +464,11 @@ def init_metrics() -> None:
     query_dropped_total.labels(reason="rate_limited").inc(0)
     query_processed_total.inc(0)
     query_queue_wait_seconds.observe(0)
+
+    # Platform Message Sends（3 个平台）
+    for _pf in ("feishu", "telegram", "discord"):
+        platform_message_sent_total.labels(platform=_pf).inc(0)
+        platform_message_duration_seconds.labels(platform=_pf).observe(0)
 
 
 def get_metrics_text() -> bytes:

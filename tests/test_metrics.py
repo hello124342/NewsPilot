@@ -103,13 +103,13 @@ class TestDeliverJobMetrics:
     """投递任务指标测试"""
 
     def test_deliver_cards_sent_increment(self):
-        """deliver_cards_sent_total 可以按 push_time 递增"""
-        deliver_cards_sent_total.labels(push_time="09:00").inc(3)
+        """deliver_cards_sent_total 可以按 push_time × platform 递增"""
+        deliver_cards_sent_total.labels(push_time="09:00", platform="feishu").inc(3)
         # 不抛异常
 
     def test_deliver_errors_increment(self):
-        """deliver_errors_total 可以按 push_time 递增"""
-        deliver_errors_total.labels(push_time="12:00").inc()
+        """deliver_errors_total 可以按 push_time × platform 递增"""
+        deliver_errors_total.labels(push_time="12:00", platform="telegram").inc()
         # 不抛异常
 
     def test_deliver_job_duration_histogram(self):

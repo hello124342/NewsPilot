@@ -12,6 +12,7 @@ import asyncio
 import logging
 
 from app.core.config import Settings
+from app.core.metrics import track_platform_send
 from app.platforms.adapter import PlatformAdapter
 from app.platforms.message_model import RichMessage, ConversationInfo
 from app.platforms.discord.renderer import render_embed, render_components
@@ -97,6 +98,7 @@ class DiscordAdapter(PlatformAdapter):
 
     # ========== 消息发送 ==========
 
+    @track_platform_send("discord")
     def send_message(self, conversation_id: str, message: RichMessage) -> dict:
         """发送富文本消息到 Discord 频道
 

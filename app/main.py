@@ -1269,12 +1269,16 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
 
                     adapter.send_message(chat_id, msg)
                     delivered += 1
-                    deliver_cards_sent_total.labels(push_time=push_time).inc()
+                    deliver_cards_sent_total.labels(
+                        push_time=push_time, platform=platform
+                    ).inc()
                 except Exception as e:
                     logger.warning(
                         f"deliver_job send failed for {article.url} to {platform}/{chat_id}: {e}"
                     )
-                    deliver_errors_total.labels(push_time=push_time).inc()
+                    deliver_errors_total.labels(
+                        push_time=push_time, platform=platform
+                    ).inc()
 
                 if limit and delivered >= limit:
                     break

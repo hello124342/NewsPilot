@@ -8,6 +8,7 @@ FeishuAdapter 包装现有 FeishuClient + renderer，实现 PlatformAdapter 接�
 import logging
 
 from app.core.config import Settings
+from app.core.metrics import track_platform_send
 from app.platforms.adapter import PlatformAdapter
 from app.platforms.message_model import RichMessage, ConversationInfo
 from app.platforms.feishu.renderer import render_card
@@ -44,6 +45,7 @@ class FeishuAdapter(PlatformAdapter):
 
     # ========== 消息发送 ==========
 
+    @track_platform_send("feishu")
     def send_message(self, conversation_id: str, message: RichMessage) -> dict:
         """发送富文本消息到飞书对话
 
