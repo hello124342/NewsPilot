@@ -1,0 +1,37 @@
+# CI 流水线 — 测试 + 覆盖率门禁
+#
+# 触发:push 到 main + 所有 PR
+# 步骤:安装 requirements-lock.txt(精确锁定,可复现)→ pytest(默认读 pyproject.toml
+#      的 --cov=app 配置)→ 覆盖率门槛 --cov-fail-under=50(实测基线 54%)
+#
+# 说明:ruff/mypy/pre-commit 属后续工程化阶段,落地后在此追加独立 job。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-lock.txt
+
+      - name: Run tests with coverage gate
+        run: pytest --cov-fail-under=50

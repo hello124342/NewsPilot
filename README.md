@@ -17,7 +17,7 @@
   <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-321%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="https://github.com/hello124342/aiNewBot"><img src="https://img.shields.io/badge/platform-Feishu_%7C_Telegram_%7C_Discord-5865F2.svg" alt="Platforms"></a>
-  <a href="#"><img src="https://img.shields.io/badge/coverage-90%25-brightgreen.svg" alt="Coverage"></a>
+  <a href="#"><img src="https://img.shields.io/badge/coverage-54%25-orange.svg" alt="Coverage"></a>
 </p>
 
 <p align="center">
