@@ -14,10 +14,10 @@
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.115+-009688.svg" alt="FastAPI"></a>
-  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-321%20passed-brightgreen.svg" alt="Tests"></a>
+  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-333%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="https://github.com/hello124342/aiNewBot"><img src="https://img.shields.io/badge/platform-Feishu_%7C_Telegram_%7C_Discord-5865F2.svg" alt="Platforms"></a>
-  <a href="#"><img src="https://img.shields.io/badge/coverage-54%25-orange.svg" alt="Coverage"></a>
+  <a href="#"><img src="https://img.shields.io/badge/coverage-57%25-yellow.svg" alt="Coverage"></a>
 </p>
 
 <p align="center">
@@ -58,7 +58,7 @@
 - **Prometheus metrics** — 30 metric families (incl. query-pool saturation)
 - **Structured logging** — JSON format, configurable `LOG_LEVEL`
 - **Circuit Breaker** — 3-state protection for external APIs
-- **321 tests** — 19 test files, TDD workflow
+- **333 tests** — 20 test files, TDD workflow
 
 </td></tr>
 </table>
@@ -221,7 +221,7 @@ pip install -r requirements-lock.txt     # exact pins
 ```bash
 curl http://localhost:8000/health          # → {"status": "ok"}
 curl http://localhost:8000/metrics         # → Prometheus metrics
-pytest -v                                  # → 321 passed
+pytest -v                                  # → 333 passed
 ```
 
 ---
@@ -328,7 +328,7 @@ aiNewBot/
 ├── docs/
 │   ├── adr/                     # 9 Architecture Decision Records
 │   └── concurrency-model.md     # Thread model analysis
-├── tests/                       # 321 tests / 19 test files
+├── tests/                       # 333 tests / 20 test files
 ├── monitoring/                  # Prometheus & Grafana configs
 ├── docker-compose.yml
 ├── Dockerfile
@@ -357,7 +357,7 @@ aiNewBot/
 ## 🧪 Testing
 
 ```bash
-pytest -v              # Full suite: 321 tests across 19 files
+pytest -v              # Full suite: 333 tests across 20 files
 pytest -v --tb=short   # Compact tracebacks
 pytest -v -k "telegram" # Run Telegram-specific tests only
 pytest -v -k "discord"  # Run Discord-specific tests only

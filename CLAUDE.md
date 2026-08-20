@@ -484,7 +484,7 @@ Commands (Chinese + English, detected via regex in `app/subscription/handler.py`
 
 This project follows **TDD** per the implementation plan in `implementation-plan.md`. The plan defines 7 sequential tasks, each requiring tests written first (`tests/`), then implementation, then `pytest -v` verification.
 
-All 7 tasks complete. RAG upgrade (+5 phases), query accuracy bug fixes, multi-platform adapter (+6 phases), Discord platform (+1 phase), and the unified bounded query pool delivered. Current test suite: **321 tests passing** across 19 test files.
+All 7 tasks complete. RAG upgrade (+5 phases), query accuracy bug fixes, multi-platform adapter (+6 phases), Discord platform (+1 phase), the unified bounded query pool, and the multi-platform observability upgrade delivered. Current test suite: **333 tests passing** across 20 test files.
 
 ## Monitoring Stack
 
