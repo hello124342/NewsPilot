@@ -86,6 +86,51 @@ deliver_errors_total = Counter(
     registry=_registry,
 )
 
+# ========== Redis Stream 推送队列 ==========
+
+deliver_queue_depth = Gauge(
+    "feishu_bot_deliver_queue_depth",
+    "当前推送 Stream 的消息条数（XLEN）",
+    registry=_registry,
+)
+
+deliver_pending_messages = Gauge(
+    "feishu_bot_deliver_pending_messages",
+    "consumer group 已投递未 ACK 的消息数（XPENDING）",
+    registry=_registry,
+)
+
+deliver_enqueued_total = Counter(
+    "feishu_bot_deliver_enqueued_total",
+    "入队的推送消息总数",
+    registry=_registry,
+)
+
+deliver_consumed_total = Counter(
+    "feishu_bot_deliver_consumed_total",
+    "消费并成功发送的推送消息总数",
+    ["platform"],
+    registry=_registry,
+)
+
+deliver_retry_total = Counter(
+    "feishu_bot_deliver_retry_total",
+    "被 XAUTOCLAIM 重投的消息总数",
+    registry=_registry,
+)
+
+deliver_dlq_total = Counter(
+    "feishu_bot_deliver_dlq_total",
+    "超过最大重试次数进入死信队列的消息总数",
+    registry=_registry,
+)
+
+queue_fallback_total = Counter(
+    "feishu_bot_queue_fallback_total",
+    "Redis 不可用时降级为内联同步发送的次数",
+    registry=_registry,
+)
+
 # ========== LLM Calls ==========
 
 llm_call_duration_seconds = Histogram(
@@ -263,6 +308,31 @@ http_request_duration_seconds = Histogram(
     registry=_registry,
 )
 
+# ========== Multi-Level Cache ==========
+
+cache_hit_total = Counter(
+    "feishu_bot_cache_hit_total",
+    "Total cache hits by cache namespace and level (l1/l2)",
+    ["cache", "level"],
+    registry=_registry,
+)
+
+cache_miss_total = Counter(
+    "feishu_bot_cache_miss_total",
+    "Total cache misses by cache namespace",
+    ["cache"],
+    registry=_registry,
+)
+
+# ========== Service Governance (熔断 / 降级) ==========
+
+degraded_requests_total = Counter(
+    "feishu_bot_degraded_requests_total",
+    "Total requests served by degraded fallback path (LLM 不可用时的关键词/列表兜底)",
+    ["path"],  # router | intent | rag_answer
+    registry=_registry,
+)
+
 # ========== Decorators 和 Context Managers ==========
 
 
@@ -435,6 +505,16 @@ def init_metrics() -> None:
             deliver_cards_sent_total.labels(push_time=_pt, platform=_pf).inc(0)
             deliver_errors_total.labels(push_time=_pt, platform=_pf).inc(0)
 
+    # Redis Stream 推送队列
+    deliver_queue_depth.set(0)
+    deliver_pending_messages.set(0)
+    deliver_enqueued_total.inc(0)
+    deliver_retry_total.inc(0)
+    deliver_dlq_total.inc(0)
+    queue_fallback_total.inc(0)
+    for _pf in ("feishu", "telegram", "discord"):
+        deliver_consumed_total.labels(platform=_pf).inc(0)
+
     # WebSocket
     ws_connection_status.set(0)
     ws_disconnect_total.inc(0)
@@ -469,6 +549,19 @@ def init_metrics() -> None:
     for _pf in ("feishu", "telegram", "discord"):
         platform_message_sent_total.labels(platform=_pf).inc(0)
         platform_message_duration_seconds.labels(platform=_pf).observe(0)
+
+    # Multi-Level Cache（3 个命名空间 × 2 层）
+    for _ns in ("llm", "embed", "db"):
+        cache_hit_total.labels(cache=_ns, level="l1").inc(0)
+        cache_hit_total.labels(cache=_ns, level="l2").inc(0)
+        cache_miss_total.labels(cache=_ns).inc(0)
+
+    # 降级路径（LLM 熔断/失败时的兜底）
+    for _path in ("router", "intent", "rag_answer"):
+        degraded_requests_total.labels(path=_path).inc(0)
+
+    # LLM 熔断器初始 CLOSED 状态
+    cb_state.labels(cb_name="llm").set(0)
 
 
 def get_metrics_text() -> bytes:

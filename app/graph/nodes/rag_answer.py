@@ -6,8 +6,18 @@ import logging
 import time as _time
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from app.graph.state import QueryState
+from app.core.resilience import CircuitBreakerOpenError
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_degraded(path: str) -> None:
+    """记录一次降级（LLM 不可用走文章列表兜底），延迟导入避免循环依赖"""
+    try:
+        from app.core.metrics import degraded_requests_total
+        degraded_requests_total.labels(path=path).inc()
+    except ImportError:
+        pass
 
 # 从 YAML 加载 Prompt 模板（失败时使用硬编码回退）
 try:
@@ -103,7 +113,7 @@ def _extract_sources(context: list[dict]) -> list[dict]:
 
 
 def rag_answer_node(state: QueryState) -> QueryState:
-    """LLM 阅读检索上下文 + 用户问题 → 综合生成答案
+    """LLM 阅读检索上下文 + 用户问题 → 综合生成答案（带缓存）
 
     读取 rag_context（检索结果），构建 prompt，调用 LLM，
     将答案文本和引用来源写入 rag_answer。
@@ -133,9 +143,15 @@ def rag_answer_node(state: QueryState) -> QueryState:
         logger.info(f"RAG answer: no context for '{question[:50]}'")
         return state
 
+    # 缓存键：question + context 的 article_id 列表（确定性）
+    import hashlib
+    context_sig = ",".join(str(a.get("id", "")) for a in context)
+    cache_key = f"rag_answer:{hashlib.sha256((question + context_sig).encode()).hexdigest()[:16]}"
+
     try:
-        from app.llm.provider import get_llm
+        from app.llm.provider import get_llm, llm_circuit_breaker
         from app.core.config import Settings
+        from app.core.multi_cache import get_llm_cache
 
         settings = Settings()  # type: ignore[call-arg]
         llm = get_llm(settings)
@@ -147,7 +163,12 @@ def rag_answer_node(state: QueryState) -> QueryState:
         )
 
         logger.info(f"RAG answer: generating for '{question[:50]}' with {len(context)} sources")
-        answer = _call_llm_answer(llm, prompt)
+        cache = get_llm_cache()
+        # 熔断器包裹：LLM 故障时 OPEN 快速失败 → 降级为检索文章列表
+        answer = cache.get_or_load(
+            cache_key,
+            lambda: llm_circuit_breaker.call(_call_llm_answer, llm, prompt),
+        )
 
         state["rag_answer"] = {
             "answer_text": answer,
@@ -155,11 +176,34 @@ def rag_answer_node(state: QueryState) -> QueryState:
         }
         logger.info(f"RAG answer generated: {len(answer)} chars, {len(context)} sources")
 
+    except CircuitBreakerOpenError:
+        # 降级：LLM 熔断，不生成答案，直接把检索到的文章列表返回给用户
+        _emit_degraded("rag_answer")
+        logger.warning("LLM circuit OPEN, RAG answer degraded to retrieved article list")
+        state["rag_answer"] = _build_degraded_answer(context)
+
     except Exception as e:
-        logger.error(f"RAG answer generation failed: {e}")
-        state["rag_answer"] = {
-            "answer_text": "⚠️ **生成答案时遇到问题，请稍后再试。**\n\n如果问题持续，可以发送「**订阅列表**」查看当前接收的厂商资讯。",
-            "sources": _extract_sources(context),
-        }
+        _emit_degraded("rag_answer")
+        logger.error(f"RAG answer generation failed, degraded to article list: {e}")
+        state["rag_answer"] = _build_degraded_answer(context)
 
     return state
+
+
+def _build_degraded_answer(context: list[dict]) -> dict:
+    """LLM 不可用时的兜底答复：不生成综合答案，直接列出检索到的相关文章。
+
+    "AI 暂时不可用，以下是相关文章" —— 保证用户仍能拿到有用信息而非空/错误。
+    """
+    lines = ["🤖 **AI 生成服务暂时繁忙，以下是检索到的相关文章：**\n"]
+    for i, article in enumerate(context, 1):
+        title = article.get("title", "（无标题）")
+        vendor = article.get("vendor", "")
+        published = article.get("published_at", "")
+        meta = " · ".join(x for x in (vendor, str(published)) if x)
+        lines.append(f"{i}. **{title}**" + (f"\n   {meta}" if meta else ""))
+    lines.append("\n💡 稍后再试可获得 AI 综合解读。")
+    return {
+        "answer_text": "\n".join(lines),
+        "sources": _extract_sources(context),
+    }

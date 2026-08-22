@@ -58,7 +58,29 @@ class Settings(BaseSettings):
     QUERY_MAX_WORKERS: int = 10  # 查询池 worker 数（LLM rate limit 是实际瓶颈）
     QUERY_MAX_QUEUE: int = 50    # 有界队列容量，打满后丢弃新请求
     QUERY_QUEUE_TIMEOUT_SECONDS: float = 0.5  # 等待队列空位的超时
-    QUERY_RATE_LIMIT_SECONDS: float = 2.0     # 每用户查询最小间隔（0=关闭限流）
+    QUERY_RATE_LIMIT_SECONDS: float = 2.0     # 每用户查询最小间隔（0=关闭限流；令牌桶模式下仅作总开关）
+    QUERY_RATE_BURST: int = 3                  # 令牌桶容量：允许用户短时突发 N 条查询
+    QUERY_RATE_REFILL: float = 0.5            # 令牌桶回填速率：每秒回填 N 个令牌（0.5=每 2 秒 1 个）
+
+    # 查询执行器模式：thread（同步线程池，默认稳定路径）| async（asyncio 协程池）
+    QUERY_EXECUTOR_MODE: str = "thread"
+    QUERY_MAX_CONCURRENCY: int = 100          # async 模式并发上限（asyncio.Semaphore）
+    QUERY_TASK_TIMEOUT_SECONDS: float = 120.0  # async 模式单任务超时（防协程泄漏）
+
+    # ========== 多级缓存配置 ==========
+    CACHE_L1_MAXSIZE: int = 2000        # L1 进程内缓存容量（LRU 淘汰）
+    CACHE_LLM_TTL: float = 3600.0       # LLM 结果缓存 TTL（秒），1h
+    CACHE_EMBED_TTL: float = 86400.0    # Embedding 缓存 TTL（秒），24h（确定性计算）
+    CACHE_DB_TTL: float = 300.0         # DB 热点读缓存 TTL（秒），5min
+
+    # ========== Redis Stream 推送队列配置 ==========
+    DELIVER_QUEUE_ENABLED: bool = True        # 是否启用 Stream 队列投递（False=回退内联同步发送）
+    DELIVER_CONSUMERS: int = 4                # 消费者线程数
+    DELIVER_MAX_RETRY: int = 3                # 单条消息最大重试次数，超限进死信队列
+    DELIVER_STREAM_MAXLEN: int = 10000        # Stream 最大长度（近似裁剪，防无界）
+    DELIVER_CLAIM_IDLE_MS: int = 60000        # 消息空闲多久（ms）后被 XAUTOCLAIM 重投
+    DELIVER_BLOCK_MS: int = 5000              # XREADGROUP 阻塞等待时长（ms）
+    DELIVER_DEDUP_TTL: int = 86400            # 幂等去重锁 TTL（秒），防重投导致重复发送
 
     # ========== 可观测性配置 ==========
     LOG_LEVEL: str = "INFO"  # DEBUG | INFO | WARNING | ERROR

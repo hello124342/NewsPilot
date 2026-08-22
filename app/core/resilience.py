@@ -151,3 +151,59 @@ class CircuitBreaker:
 class CircuitBreakerOpenError(Exception):
     """熔断器 OPEN 状态时抛出的异常（快速失败）"""
     pass
+
+
+# ========== Token Bucket Rate Limiter ==========
+
+class TokenBucket:
+    """令牌桶限流器（支持突发 + 平滑限流）
+
+    相比固定窗口（N 秒内 1 次）的优势：
+    - 允许短时突发（capacity 个令牌）而非一刀切拒绝
+    - 持续刷屏仍被限（令牌耗尽需等待回填）
+    - 更符合人类行为（连问 2-3 条合理问题不误杀）
+
+    算法：每秒回填 refill_rate 个令牌，桶容量 capacity。
+    请求消耗 1 个令牌，桶空时拒绝。
+
+    线程安全：threading.Lock 保护桶状态。
+    """
+
+    def __init__(self, capacity: int = 3, refill_rate: float = 0.5):
+        """
+        Args:
+            capacity: 桶容量（最多积累 N 个令牌，支持 N 次突发）
+            refill_rate: 令牌回填速率（每秒回填 N 个）
+        """
+        self.capacity = float(capacity)
+        self.refill_rate = refill_rate
+        self.tokens = float(capacity)  # 初始满桶
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self) -> None:
+        """按时间流逝回填令牌（内部调用，需持锁）"""
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+
+    def allow(self) -> bool:
+        """尝试消耗 1 个令牌
+
+        Returns:
+            True 允许通过，False 被限流
+        """
+        with self._lock:
+            self._refill()
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
+
+    def reset(self) -> None:
+        """重置桶为满状态（测试用）"""
+        with self._lock:
+            self.tokens = self.capacity
+            self.last_refill = time.monotonic()
+

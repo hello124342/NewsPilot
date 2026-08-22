@@ -433,6 +433,9 @@ class TestPreferences:
         """每个测试前清除缓存，避免跨测试污染"""
         from app.core.cache import chat_pref_cache
         chat_pref_cache.clear()
+        # 同时重置新的两级缓存（Phase 1 引入），否则默认值会被缓存命中掩盖真实 DB 读
+        from app.core.multi_cache import reset_caches_for_tests
+        reset_caches_for_tests()
 
     @patch("app.db.sql_repositories.SessionLocal")
     def test_get_preference_default(self, mock_session):

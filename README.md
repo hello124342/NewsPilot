@@ -14,7 +14,7 @@
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.115+-009688.svg" alt="FastAPI"></a>
-  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-333%20passed-brightgreen.svg" alt="Tests"></a>
+  <a href="https://github.com/hello124342/aiNewBot/actions"><img src="https://img.shields.io/badge/tests-355%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="https://github.com/hello124342/aiNewBot"><img src="https://img.shields.io/badge/platform-Feishu_%7C_Telegram_%7C_Discord-5865F2.svg" alt="Platforms"></a>
   <a href="#"><img src="https://img.shields.io/badge/coverage-57%25-yellow.svg" alt="Coverage"></a>
@@ -54,11 +54,14 @@
 - **Per-vendor subscriptions** — granular control per chat
 
 ### 📊 Production Ready
-- **Grafana dashboard** — 8-row pre-built monitoring
-- **Prometheus metrics** — 30 metric families (incl. query-pool saturation)
+- **Grafana dashboard** — 10-row pre-built monitoring
+- **Prometheus metrics** — 43 metric families (incl. query-pool saturation, cache hit rate, queue backlog)
 - **Structured logging** — JSON format, configurable `LOG_LEVEL`
-- **Circuit Breaker** — 3-state protection for external APIs
-- **333 tests** — 20 test files, TDD workflow
+- **Service governance** — LLM circuit breaker + keyword/list degradation + token-bucket rate limit
+- **Multi-level cache** — L1 LRU + L2 Redis (singleflight · null-cache · TTL jitter)
+- **Redis Stream queue** — at-least-once push delivery + XAUTOCLAIM retry + DLQ + idempotency lock
+- **Async execution** — feature-flagged asyncio pool (thread → coroutine, 9.7× throughput on IO-bound load)
+- **355 tests** — 22 test files, TDD workflow
 
 </td></tr>
 </table>
@@ -150,6 +153,39 @@ adapter.send_message(chat_id, RichMessage(
 | **Facade** | `subscription/handler.py` · `chat/lifecycle.py` | Backward-compat delegation to Repository |
 | **Decorator** | `core/metrics.py` | `@track_llm_call` · `@track_feishu_api` |
 
+### ⚡ Concurrency & Reliability
+
+An enterprise-grade concurrency stack layered on top of the business logic — every piece is feature-flagged or degrades gracefully, so the bot stays up when a dependency doesn't.
+
+```
+        submit(query)                          deliver_job (push)
+             │                                        │
+   ┌─────────▼──────────┐                   ┌─────────▼──────────┐
+   │  Query Executor    │                   │  Redis Stream Queue │
+   │  thread │ async ◄── QUERY_EXECUTOR_MODE │  XADD → XREADGROUP  │
+   │  token-bucket RL   │                   │  XACK / XAUTOCLAIM  │
+   └─────────┬──────────┘                   │  DLQ + idempotency  │
+             │                              └─────────┬──────────┘
+   ┌─────────▼──────────┐                   ┌─────────▼──────────┐
+   │  Multi-Level Cache │                   │  N consumer threads │
+   │  L1 LRU → L2 Redis │                   │  render → send → ACK│
+   │  singleflight/jitter│                  └────────────────────┘
+   └─────────┬──────────┘
+   ┌─────────▼──────────┐
+   │  LLM Circuit Breaker│  OPEN → fast-fail <1ms → keyword/list degradation
+   └────────────────────┘
+```
+
+| Concern | Mechanism | Key file | ADR |
+|---------|-----------|----------|-----|
+| **Throughput** | Feature-flagged asyncio coroutine pool (`QUERY_EXECUTOR_MODE=thread\|async`), `Semaphore(100)` backpressure — transparent to platform layer via submit-delegate | `core/async_query_executor.py` | [0013](./docs/adr/0013-async-query-pipeline.md) |
+| **Reliable delivery** | Redis Stream, at-least-once, XAUTOCLAIM retry, DLQ after 3 tries, idempotency lock (`SET NX EX`); inline fallback when Redis down | `queue/stream_queue.py` · `queue/deliver_consumer.py` | [0011](./docs/adr/0011-redis-stream-delivery-queue.md) |
+| **Cost / latency** | L1 LRU + L2 Redis, singleflight (breakdown), null-cache (penetration), ±10% TTL jitter (avalanche) | `core/multi_cache.py` | [0010](./docs/adr/0010-multi-level-cache.md) |
+| **Fault tolerance** | LLM circuit breaker (5-fail → OPEN → fast-fail), keyword/article-list degradation | `llm/provider.py` · `graph/nodes/` | [0012](./docs/adr/0012-llm-circuit-breaker-and-degradation.md) |
+| **Overload** | Per-user token bucket (`burst=3`, `refill=0.5/s`) — tolerates bursts, throttles spam | `core/query_executor.py` | — |
+
+> **Benchmark:** `python scripts/benchmark_query.py` — IO-bound load, thread QPS 20 → async QPS 195 (**9.7×**). Full results in [docs/benchmark-results.md](./docs/benchmark-results.md).
+
 ---
 
 ## 🚀 Quick Start
@@ -221,7 +257,7 @@ pip install -r requirements-lock.txt     # exact pins
 ```bash
 curl http://localhost:8000/health          # → {"status": "ok"}
 curl http://localhost:8000/metrics         # → Prometheus metrics
-pytest -v                                  # → 333 passed
+pytest -v                                  # → 355 passed
 ```
 
 ---
@@ -299,7 +335,7 @@ The `docker-compose` stack includes a full observability pipeline:
 | **Prometheus** | http://localhost:9090 | — |
 | **App Metrics** | http://localhost:8000/metrics | — |
 
-**Dashboard panels:** HTTP traffic · RSS pipeline · Push delivery · LLM calls · Feishu API · Telegram API · Circuit breaker · WebSocket status · Content scraping · RAG queries
+**Dashboard panels:** KPI overview · HTTP traffic · RSS pipeline · Push delivery · LLM calls · Feishu API · WebSocket status · Platform breakdown · **Cache & governance** (hit rate · degradation · query-pool saturation) · **Redis Stream queue** (backlog · enqueue vs consume · retry/DLQ/fallback)
 
 ---
 
@@ -321,14 +357,17 @@ aiNewBot/
 │   ├── feishu/                  # Feishu SDK client, card builders, WS event router
 │   ├── fetcher/                 # RSS parser, Kimi scraper, Trafilatura extractor
 │   ├── graph/                   # LangGraph: 2 graphs, 13 nodes, state definitions
-│   ├── llm/                     # Multi-provider LLM factory
+│   ├── llm/                     # Multi-provider LLM factory + circuit breaker
+│   ├── queue/                   # ★ Redis Stream delivery queue + consumer pool
 │   ├── rag/                     # ChromaDB vector store + OpenAI embeddings
 │   ├── subscription/            # Subscription commands & domain logic
 │   └── chat/                    # Chat lifecycle & permissions
 ├── docs/
-│   ├── adr/                     # 9 Architecture Decision Records
+│   ├── adr/                     # 13 Architecture Decision Records
+│   ├── benchmark-results.md     # thread vs async throughput benchmark
 │   └── concurrency-model.md     # Thread model analysis
-├── tests/                       # 333 tests / 20 test files
+├── scripts/                     # benchmark_query.py (thread vs async)
+├── tests/                       # 355 tests / 22 test files
 ├── monitoring/                  # Prometheus & Grafana configs
 ├── docker-compose.yml
 ├── Dockerfile
@@ -349,7 +388,12 @@ aiNewBot/
 | [ADR 0007](./docs/adr/0007-observability-stack.md) | Observability design rationale |
 | [ADR 0008](./docs/adr/0008-rag-upgrade.md) | RAG upgrade decision |
 | [ADR 0009](./docs/adr/0009-multi-platform-adapter.md) | Multi-platform adapter pattern |
+| [ADR 0010](./docs/adr/0010-multi-level-cache.md) | Multi-level cache: two levels + three guards |
+| [ADR 0011](./docs/adr/0011-redis-stream-delivery-queue.md) | Redis Stream delivery queue (queue on push, not query) |
+| [ADR 0012](./docs/adr/0012-llm-circuit-breaker-and-degradation.md) | LLM circuit breaker + degradation |
+| [ADR 0013](./docs/adr/0013-async-query-pipeline.md) | Async query pipeline (thread → asyncio, feature flag) |
 | [Concurrency Model](./docs/concurrency-model.md) | Thread model with bottleneck analysis |
+| [Benchmark Results](./docs/benchmark-results.md) | thread vs async throughput (9.7×) |
 | [Implementation Plan](./implementation-plan.md) | TDD task breakdown (v1–v3) |
 
 ---
@@ -357,7 +401,7 @@ aiNewBot/
 ## 🧪 Testing
 
 ```bash
-pytest -v              # Full suite: 333 tests across 20 files
+pytest -v              # Full suite: 355 tests across 22 files
 pytest -v --tb=short   # Compact tracebacks
 pytest -v -k "telegram" # Run Telegram-specific tests only
 pytest -v -k "discord"  # Run Discord-specific tests only

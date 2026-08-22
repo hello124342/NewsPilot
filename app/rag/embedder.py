@@ -69,7 +69,7 @@ def _call_embedding_api(client, text: str) -> list[float]:
 
 
 def get_embedding(text: str) -> list[float]:
-    """对单段文本生成 embedding 向量
+    """对单段文本生成 embedding 向量（带两级缓存）
 
     Args:
         text: 待嵌入的文本（超过 4096 字符自动截断）
@@ -81,8 +81,18 @@ def get_embedding(text: str) -> list[float]:
         logger.warning("get_embedding: empty text, returning zero vector")
         return [0.0] * 1536
 
-    client = _get_openai_client()
-    return _call_embedding_api(client, text)
+    # 缓存键：sha256(text) 前 16 字符（碰撞概率可忽略）
+    import hashlib
+    cache_key = hashlib.sha256(text.encode()).hexdigest()[:16]
+
+    from app.core.multi_cache import get_embed_cache
+    cache = get_embed_cache()
+
+    def _load():
+        client = _get_openai_client()
+        return _call_embedding_api(client, text)
+
+    return cache.get_or_load(cache_key, _load)
 
 
 def build_article_embed_text(title: str, vendor: str, summary_points: str, channel: str = "") -> str:

@@ -69,21 +69,44 @@ class TestQueryExecutor:
             _reconfigure()
 
     def test_rate_limit_blocks_same_user(self, small_pool):
-        _reconfigure(max_workers=2, max_queue=10, queue_timeout=0.1, rate_limit_seconds=5)
+        # burst=1 → 令牌桶退化为单请求限流：一次放行后立即耗尽
+        _reconfigure(
+            max_workers=2, max_queue=10, queue_timeout=0.1,
+            rate_limit_seconds=5, rate_burst=1, rate_refill=0.1,
+        )
         try:
             assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
-            # 窗口内再次提交同用户 → 限流
+            # 令牌耗尽 → 限流
             assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.RATE_LIMITED
-            # 不同用户不受影响
+            # 不同用户独立令牌桶，不受影响
             assert submit(lambda: None, user_id="u2") is QuerySubmitStatus.ACCEPTED
         finally:
             _reconfigure()
 
-    def test_rate_limit_expires(self, small_pool):
-        _reconfigure(max_workers=2, max_queue=10, queue_timeout=0.1, rate_limit_seconds=0.2)
+    def test_rate_limit_allows_burst(self, small_pool):
+        # 令牌桶允许短突发：burst=3 → 用户可连问 3 条，第 4 条被限
+        _reconfigure(
+            max_workers=4, max_queue=10, queue_timeout=0.1,
+            rate_limit_seconds=5, rate_burst=3, rate_refill=0.1,
+        )
         try:
             assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
-            time.sleep(0.4)
+            assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
+            assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
+            # 突发额度耗尽 → 限流
+            assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.RATE_LIMITED
+        finally:
+            _reconfigure()
+
+    def test_rate_limit_expires(self, small_pool):
+        # 令牌回填：耗尽后等待足够时间，令牌回填至 >=1 即再次放行
+        _reconfigure(
+            max_workers=2, max_queue=10, queue_timeout=0.1,
+            rate_limit_seconds=0.2, rate_burst=1, rate_refill=5.0,
+        )
+        try:
+            assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
+            time.sleep(0.4)  # refill=5/s → 0.4s 回填 2 个令牌
             assert submit(lambda: None, user_id="u1") is QuerySubmitStatus.ACCEPTED
         finally:
             _reconfigure()
@@ -150,6 +173,8 @@ class TestQueryConfig:
         assert s.QUERY_MAX_QUEUE >= 1
         assert s.QUERY_QUEUE_TIMEOUT_SECONDS >= 0
         assert s.QUERY_RATE_LIMIT_SECONDS >= 0
+        assert s.QUERY_RATE_BURST >= 1
+        assert s.QUERY_RATE_REFILL > 0
 
 
 class TestPlatformWiring:
