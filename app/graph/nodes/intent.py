@@ -9,10 +9,20 @@ import logging
 import re
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from app.graph.state import QueryState
-from app.llm.provider import get_llm
+from app.llm.provider import get_llm, llm_circuit_breaker
 from app.core.config import Settings
+from app.core.resilience import CircuitBreakerOpenError
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_degraded(path: str) -> None:
+    """记录一次降级（LLM 不可用走关键词兜底），延迟导入避免循环依赖"""
+    try:
+        from app.core.metrics import degraded_requests_total
+        degraded_requests_total.labels(path=path).inc()
+    except ImportError:
+        pass
 
 # 已知厂商列表（与 subscription/handler.py ALL_VENDORS 保持一致）
 KNOWN_VENDORS = [
@@ -139,14 +149,19 @@ def _emit_llm_metric(operation: str, elapsed: float, success: bool) -> None:
 
 
 def intent_node(state: QueryState) -> QueryState:
-    """解析用户 @Bot 消息的查询意图
+    """解析用户 @Bot 消息的查询意图（带 LLM 结果缓存）
 
     优先用 LLM 解析（3次重试），失败时降级为关键词匹配。
     """
     query = state.get("user_query", "")
     logger.info(f"Parsing intent for: '{query[:80]}'")
 
+    # 缓存键：operation + sha256(query)
+    import hashlib
+    cache_key = f"intent:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+
     try:
+        from app.core.multi_cache import get_llm_cache
         settings = Settings()  # type: ignore[call-arg]
         llm = get_llm(settings)
 
@@ -154,7 +169,12 @@ def intent_node(state: QueryState) -> QueryState:
             query=query,
             vendors=", ".join(KNOWN_VENDORS),
         )
-        content = _call_llm_intent(llm, prompt)
+
+        cache = get_llm_cache()
+        content = cache.get_or_load(
+            cache_key,
+            lambda: llm_circuit_breaker.call(_call_llm_intent, llm, prompt),
+        )
 
         # 尝试提取 JSON
         json_match = re.search(r"\{[^}]+\}", content)
@@ -171,7 +191,11 @@ def intent_node(state: QueryState) -> QueryState:
             logger.info(f"Intent parsed: vendor={result.get('vendor')}, days={days}")
             return state
 
+    except CircuitBreakerOpenError:
+        _emit_degraded("intent")
+        logger.warning("LLM circuit OPEN, intent parsing degraded to keyword heuristic")
     except Exception as e:
+        _emit_degraded("intent")
         logger.warning(f"LLM intent parsing failed, falling back: {e}")
 
     # 降级：关键词匹配（含日期启发式提取）

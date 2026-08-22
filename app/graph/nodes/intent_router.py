@@ -11,8 +11,18 @@ import json
 import logging
 import re
 from app.graph.state import QueryState
+from app.core.resilience import CircuitBreakerOpenError
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_degraded(path: str) -> None:
+    """记录一次降级（LLM 不可用走兜底链路），延迟导入避免循环依赖"""
+    try:
+        from app.core.metrics import degraded_requests_total
+        degraded_requests_total.labels(path=path).inc()
+    except ImportError:
+        pass
 
 # 轻量分类 Prompt（复用项目的 YAML loader 模式）
 _INTENT_ROUTER_PROMPT = """你是查询意图分类器。判断用户消息属于哪种类型，返回 JSON。
@@ -69,7 +79,7 @@ def _classify_by_keywords(query: str) -> str:
 
 
 def intent_router_node(state: QueryState) -> QueryState:
-    """分类用户意图并写入 state
+    """分类用户意图并写入 state（带 LLM 结果缓存）
 
     优先走 LLM 分类（3 次重试通过 _call_llm_router），
     失败时降级为关键词启发式。
@@ -79,10 +89,15 @@ def intent_router_node(state: QueryState) -> QueryState:
         state["query_type"] = "list"
         return state
 
-    # 尝试 LLM 分类
+    # 缓存键：operation + sha256(query)
+    import hashlib
+    cache_key = f"router:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+
+    # 尝试 LLM 分类（带缓存 + 熔断保护）
     try:
-        from app.llm.provider import get_llm
+        from app.llm.provider import get_llm, llm_circuit_breaker
         from app.core.config import Settings
+        from app.core.multi_cache import get_llm_cache
         from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
         @retry(
@@ -98,7 +113,13 @@ def intent_router_node(state: QueryState) -> QueryState:
         settings = Settings()  # type: ignore[call-arg]
         llm = get_llm(settings)
         prompt = _INTENT_ROUTER_PROMPT.format(query=query)
-        content = _call_llm_router(llm, prompt)
+
+        # 熔断器包裹：LLM 连续故障时 OPEN 快速失败，直接落降级链路
+        cache = get_llm_cache()
+        content = cache.get_or_load(
+            cache_key,
+            lambda: llm_circuit_breaker.call(_call_llm_router, llm, prompt),
+        )
 
         json_match = re.search(r"\{[^}]+\}", content)
         if json_match:
@@ -109,7 +130,11 @@ def intent_router_node(state: QueryState) -> QueryState:
                 logger.info(f"Intent routed: '{query[:50]}' → {query_type} (LLM)")
                 return state
 
+    except CircuitBreakerOpenError:
+        _emit_degraded("router")
+        logger.warning("LLM circuit OPEN, intent routing degraded to keyword heuristic")
     except Exception as e:
+        _emit_degraded("router")
         logger.warning(f"LLM intent routing failed, falling back to keywords: {e}")
 
     # 降级：关键词启发式

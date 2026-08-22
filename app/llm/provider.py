@@ -11,8 +11,15 @@ from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from app.core.config import Settings
+from app.core.resilience import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+# LLM 熔断器：连续 5 次失败后熔断 30s，OPEN 时快速失败（<1ms）而非重试 30s 占死 worker。
+# 所有节点的 LLM 调用统一经此熔断，避免上游 LLM 故障时线程池被慢调用拖垮。
+# 熔断触发降级链路（关键词兜底 / 检索结果列表）——见各节点的 CircuitBreakerOpenError 处理。
+llm_circuit_breaker = CircuitBreaker("llm", failure_threshold=5, recovery_timeout=30.0)
+
 
 # 支持的厂商及对应的 API Key 字段名
 _SUPPORTED_PROVIDERS = {

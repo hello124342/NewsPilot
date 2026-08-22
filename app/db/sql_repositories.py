@@ -211,8 +211,12 @@ class SqlSubscriptionRepository(SubscriptionRepository):
 
     def get_preference(self, chat_id: str, db: Session | None = None,
                        platform: str = "feishu") -> dict:
-        cache_key = f"{platform}:{chat_id}:pref"
-        cached = chat_pref_cache.get(cache_key)
+        # 双层缓存：旧 TTLCache（进程内）+ 新 MultiLevelCache（L1+L2）
+        # 保留旧缓存键以保持向后兼容，新缓存键加 "v2:" 前缀
+        cache_key_old = f"{platform}:{chat_id}:pref"
+        cache_key_new = f"v2:pref:{platform}:{chat_id}"
+
+        cached = chat_pref_cache.get(cache_key_old)
         if cached is not None:
             return cached
 
@@ -228,20 +232,29 @@ class SqlSubscriptionRepository(SubscriptionRepository):
                 if pref
                 else {"push_time": "09:00", "frequency": "daily"}
             )
-            chat_pref_cache.set(cache_key, result)
+            chat_pref_cache.set(cache_key_old, result)
             return result
 
-        if db is not None:
-            return _query(db)
+        # 通过新缓存（带 L2）查询
+        from app.core.multi_cache import get_db_cache
+        cache = get_db_cache()
 
-        session = SessionLocal()
-        try:
-            return _query(session)
-        except Exception as e:
-            logger.error(f"get_preference failed: {e}")
-            return {"push_time": "09:00", "frequency": "daily"}
-        finally:
-            session.close()
+        if db is not None:
+            result = _query(db)
+            cache.set(cache_key_new, result)  # 回填新缓存
+            return result
+
+        def _load():
+            session = SessionLocal()
+            try:
+                return _query(session)
+            except Exception as e:
+                logger.error(f"get_preference failed: {e}")
+                return {"push_time": "09:00", "frequency": "daily"}
+            finally:
+                session.close()
+
+        return cache.get_or_load(cache_key_new, _load)
 
     def set_push_time(self, chat_id: str, push_time: str, db: Session | None = None,
                       platform: str = "feishu") -> dict:
@@ -262,7 +275,10 @@ class SqlSubscriptionRepository(SubscriptionRepository):
                 session.add(pref)
             session.commit()
             result = {"push_time": pref.push_time, "frequency": pref.frequency}
+            # 失效两层缓存
             chat_pref_cache.set(f"{platform}:{chat_id}:pref", result)
+            from app.core.multi_cache import get_db_cache
+            get_db_cache().delete(f"v2:pref:{platform}:{chat_id}")
             logger.info(f"Push time set: platform={platform}, chat_id={chat_id}, time={push_time}")
             return result
 
@@ -303,7 +319,10 @@ class SqlSubscriptionRepository(SubscriptionRepository):
                 session.add(pref)
             session.commit()
             result = {"push_time": pref.push_time, "frequency": pref.frequency}
+            # 失效两层缓存
             chat_pref_cache.set(f"{platform}:{chat_id}:pref", result)
+            from app.core.multi_cache import get_db_cache
+            get_db_cache().delete(f"v2:pref:{platform}:{chat_id}")
             logger.info(f"Frequency set: platform={platform}, chat_id={chat_id}, freq={frequency}")
             return result
 

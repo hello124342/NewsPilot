@@ -91,6 +91,27 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("APScheduler started: process at 05:00, deliver at 09:00/12:00/18:00")
 
+    # --- 启动推送投递消费者（Redis Stream 消费端，独立线程池） ---
+    try:
+        from app.queue.deliver_consumer import start_consumers
+        start_consumers(settings)
+    except Exception as e:
+        logger.warning(f"Deliver consumers not started: {e}")
+
+    # --- 查询执行器模式切换（thread=同步线程池默认；async=asyncio 协程池灰度） ---
+    if settings.QUERY_EXECUTOR_MODE.strip().lower() == "async":
+        try:
+            from app.core.async_query_executor import start_async_executor
+            from app.core.query_executor import set_submit_delegate
+            async_exec = start_async_executor(settings)
+            set_submit_delegate(async_exec.submit)  # 平台层无感转发到协程池
+            _app_services["async_executor"] = async_exec
+            logger.info("Query executor mode: async (asyncio coroutine pool)")
+        except Exception as e:
+            logger.error(f"Async executor start failed, falling back to thread pool: {e}")
+    else:
+        logger.info("Query executor mode: thread (sync thread pool)")
+
     # --- 启动飞书 WebSocket 长连接（独立 daemon 线程） ---
     from app.feishu.client import FeishuClient
     from app.feishu.event_router import build_event_handler
@@ -234,9 +255,23 @@ async def lifespan(app: FastAPI):
 
     yield
     scheduler.shutdown()
+    # 优雅关闭推送消费者（未 ACK 消息留在 stream，重启后续投）
+    try:
+        from app.queue.deliver_consumer import stop_consumers
+        stop_consumers()
+    except Exception as e:
+        logger.warning(f"Deliver consumers shutdown error: {e}")
     # 优雅关闭事件处理线程池（等待正在处理的请求完成）
     from app.feishu.event_router import shutdown_executor
     shutdown_executor(wait=True)
+    # 注销异步委托并停止协程池（async 模式）
+    try:
+        from app.core.query_executor import set_submit_delegate
+        set_submit_delegate(None)
+        from app.core.async_query_executor import shutdown_async_executor
+        shutdown_async_executor(wait=True)
+    except Exception as e:
+        logger.warning(f"Async executor shutdown error: {e}")
     # 优雅关闭共享查询池
     from app.core.query_executor import shutdown as query_shutdown
     query_shutdown(wait=True)
@@ -1135,29 +1170,35 @@ def schedule_rss_polling():
 
 
 def deliver_job(push_time: str, limit: int = 0) -> dict:
-    """按用户偏好推送今日已存储的文章（多平台）
+    """按用户偏好将今日已存储的文章投递到各平台 chat（多平台）
 
     Args:
         push_time: 当前推送时间窗口（"09:00" / "12:00" / "18:00"）
-        limit: 最多推送 N 篇（0=全部）
+        limit: 最多投递 N 条（0=全部）
 
-    逻辑：
+    逻辑（生产者）：
     1. 查询今日存储的所有文章
     2. 查询所有平台活跃 chat（含 platform 信息）
-    3. 对每篇文章，按 推送时间 → 频率 → 订阅 三层过滤后推送
-    4. 根据 chat 所属平台使用对应 Adapter 发送
+    3. 对每篇文章，按 推送时间 → 频率 → 订阅 三层过滤
+    4. 命中的 (article, platform, chat) 逐条入队到 Redis Stream；实际发送由
+       deliver_consumer 异步完成（可靠投递：崩溃重投 + 幂等去重 + 死信）
+    5. Redis 不可用时降级为内联同步发送（Redis 挂了推送不挂）
     """
     import time as _time
-    from datetime import date, datetime, timezone
+    from datetime import datetime, timezone
     from app.db.database import SessionLocal
-    from app.db.models import NewsArticle, ChatRegistry, Subscription
+    from app.db.models import NewsArticle, ChatRegistry
     from app.subscription.handler import (
         get_preference, get_subscribers, has_any_subscription,
         is_today_in_frequency,
     )
-    from app.platforms.message_model import RichMessage, ActionButton
     from app.platforms.registry import get_platform_adapter
-    from app.core.metrics import deliver_cards_sent_total, deliver_errors_total, deliver_job_duration_seconds
+    from app.queue.stream_queue import get_stream_queue
+    from app.queue.deliver_consumer import build_article_message
+    from app.core.metrics import (
+        deliver_cards_sent_total, deliver_errors_total, deliver_job_duration_seconds,
+        deliver_enqueued_total, queue_fallback_total,
+    )
 
     start_time = _time.perf_counter()
     settings = Settings()  # type: ignore[call-arg]
@@ -1171,7 +1212,7 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
             .all()
         )
         # 按平台分组：{platform: [chat_id, ...]}
-        platform_chats: dict[str, list[tuple[str, str]]] = {}
+        platform_chats: dict[str, list[str]] = {}
         for chat in active_chats:
             conv_id = chat.conversation_id or chat.chat_id
             platform = chat.platform or "feishu"
@@ -1186,11 +1227,7 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
     if total_chats == 0:
         logger.info(f"deliver_job({push_time}): no active chats")
         deliver_job_duration_seconds.labels(push_time=push_time).observe(_time.perf_counter() - start_time)
-        return {"status": "ok", "delivered": 0}
-    logger.info(
-        f"deliver_job({push_time}): targeting {total_chats} active chat(s) "
-        f"across {list(platform_chats.keys())}"
-    )
+        return {"status": "ok", "delivered": 0, "enqueued": 0}
 
     # 查询今日文章
     db = SessionLocal()
@@ -1211,85 +1248,84 @@ def deliver_job(push_time: str, limit: int = 0) -> dict:
     if not articles:
         logger.info(f"deliver_job({push_time}): no articles to deliver")
         deliver_job_duration_seconds.labels(push_time=push_time).observe(_time.perf_counter() - start_time)
-        return {"status": "ok", "delivered": 0}
+        return {"status": "ok", "delivered": 0, "enqueued": 0}
 
-    delivered = 0
+    # 是否启用队列：配置开启且 Redis 可用；否则降级内联发送
+    queue = get_stream_queue() if settings.DELIVER_QUEUE_ENABLED else None
+    use_queue = queue is not None
+    if not use_queue:
+        queue_fallback_total.inc()
+        logger.warning(f"deliver_job({push_time}): queue unavailable, falling back to inline send")
+
+    enqueued = 0   # 入队条数
+    delivered = 0  # 内联降级时的实际发送条数
+    count = 0      # 命中过滤的目标条数（用于 limit）
+    stop = False
+
     for article in articles:
+        if stop:
+            break
         vendor = article.vendor
-        points = (article.summary_points or "").split("\n") if article.summary_points else []
 
         for platform, chat_list in platform_chats.items():
-            adapter = get_platform_adapter(platform, settings)
-            if adapter is None:
-                logger.warning(f"deliver_job: platform '{platform}' adapter not available, skipping {len(chat_list)} chats")
-                continue
+            if stop:
+                break
+            adapter = None
+            if not use_queue:
+                adapter = get_platform_adapter(platform, settings)
+                if adapter is None:
+                    logger.warning(f"deliver_job: platform '{platform}' adapter unavailable, skipping {len(chat_list)} chats")
+                    continue
 
             for chat_id in chat_list:
                 # 过滤 1: 推送时间匹配
                 pref = get_preference(chat_id, platform=platform)
                 if pref["push_time"] != push_time:
                     continue
-
                 # 过滤 2: 频率匹配
                 if not is_today_in_frequency(pref["frequency"]):
                     continue
-
                 # 过滤 3: 订阅匹配
                 if has_any_subscription(chat_id, platform=platform):
                     subscribers = set(get_subscribers(vendor, platform=platform))
                     if chat_id not in subscribers:
                         continue
 
-                # 发送（平台感知）
-                try:
-                    pub_date = article.published_at.strftime("%Y-%m-%d") if article.published_at else ""
+                count += 1
+                if use_queue:
+                    # 纯生产者：入队瘦身消息，消费者按 article_id 查库渲染
+                    try:
+                        queue.enqueue({
+                            "article_id": article.id,
+                            "platform": platform,
+                            "conversation_id": chat_id,
+                            "push_time": push_time,
+                            "retry_count": 0,
+                            "enqueued_at": _time.time(),
+                        })
+                        enqueued += 1
+                        deliver_enqueued_total.inc()
+                    except Exception as e:
+                        logger.error(f"deliver_job enqueue failed: {e}")
+                        deliver_errors_total.labels(push_time=push_time, platform=platform).inc()
+                else:
+                    # 降级：内联同步发送
+                    try:
+                        adapter.send_message(chat_id, build_article_message(article, vendor))
+                        delivered += 1
+                        deliver_cards_sent_total.labels(push_time=push_time, platform=platform).inc()
+                    except Exception as e:
+                        logger.warning(f"deliver_job inline send failed for {article.url} to {platform}/{chat_id}: {e}")
+                        deliver_errors_total.labels(push_time=push_time, platform=platform).inc()
 
-                    # 构建 RichMessage（平台无关）
-                    points_md = "\n".join(f"  {i}. {p}" for i, p in enumerate(points, 1)) if points else "暂无摘要"
-                    body = (
-                        f"📰 **{article.title}**\n\n"
-                        f"💡 **核心要点总结**\n{points_md}"
-                    )
-
-                    msg = RichMessage(
-                        title=vendor,
-                        body=body,
-                        buttons=[
-                            ActionButton(label="📖 阅读原文", action="url", value=article.url or "", style="primary"),
-                            ActionButton(
-                                label=f"🔕 退订 {vendor}",
-                                action="callback",
-                                value=f'{{"action":"unsubscribe","vendor":"{vendor}"}}',
-                                style="default",
-                            ),
-                        ],
-                        color_hint="info",
-                        footer=f"📅 {pub_date}",
-                    )
-
-                    adapter.send_message(chat_id, msg)
-                    delivered += 1
-                    deliver_cards_sent_total.labels(
-                        push_time=push_time, platform=platform
-                    ).inc()
-                except Exception as e:
-                    logger.warning(
-                        f"deliver_job send failed for {article.url} to {platform}/{chat_id}: {e}"
-                    )
-                    deliver_errors_total.labels(
-                        push_time=push_time, platform=platform
-                    ).inc()
-
-                if limit and delivered >= limit:
+                if limit and count >= limit:
+                    stop = True
                     break
-
-            if limit and delivered >= limit:
-                break
-
-        if limit and delivered >= limit:
-            break
 
     elapsed = _time.perf_counter() - start_time
     deliver_job_duration_seconds.labels(push_time=push_time).observe(elapsed)
-    logger.info(f"deliver_job({push_time}): {delivered} cards sent across {len(platform_chats)} platform(s)")
-    return {"status": "ok", "delivered": delivered}
+    if use_queue:
+        logger.info(f"deliver_job({push_time}): enqueued {enqueued} message(s) across {len(platform_chats)} platform(s)")
+        return {"status": "ok", "enqueued": enqueued, "mode": "queue"}
+    logger.info(f"deliver_job({push_time}): {delivered} cards sent inline (fallback) across {len(platform_chats)} platform(s)")
+    return {"status": "ok", "delivered": delivered, "mode": "inline"}

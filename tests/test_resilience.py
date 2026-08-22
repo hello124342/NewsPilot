@@ -5,7 +5,7 @@
 import time
 import pytest
 
-from app.core.resilience import CircuitBreaker, CircuitBreakerOpenError, CircuitState
+from app.core.resilience import CircuitBreaker, CircuitBreakerOpenError, CircuitState, TokenBucket
 
 
 class TestCircuitBreakerStates:
@@ -111,3 +111,61 @@ class TestCircuitBreakerStates:
         assert status["state"] == "closed"
         assert status["failure_count"] == 0
         assert status["threshold"] == 5
+
+
+class TestTokenBucket:
+    """令牌桶限流器测试"""
+
+    def test_initial_full_bucket_allows_burst(self):
+        """初始满桶：允许 capacity 次突发"""
+        bucket = TokenBucket(capacity=3, refill_rate=0.01)
+        assert bucket.allow() is True
+        assert bucket.allow() is True
+        assert bucket.allow() is True
+        # 第 4 次令牌耗尽 → 拒绝
+        assert bucket.allow() is False
+
+    def test_refill_over_time(self):
+        """令牌随时间回填：耗尽后等待即可再次放行"""
+        bucket = TokenBucket(capacity=1, refill_rate=10.0)  # 每秒 10 个
+        assert bucket.allow() is True
+        assert bucket.allow() is False  # 立即耗尽
+        time.sleep(0.15)  # 0.15s 回填 ~1.5 个令牌
+        assert bucket.allow() is True
+
+    def test_capacity_cap(self):
+        """回填不超过 capacity（长时间空闲不会积累超额令牌）"""
+        bucket = TokenBucket(capacity=2, refill_rate=100.0)
+        time.sleep(0.1)  # 理论回填 10 个，但上限为 2
+        assert bucket.allow() is True
+        assert bucket.allow() is True
+        assert bucket.allow() is False  # 最多只有 2 个
+
+    def test_reset(self):
+        """reset 恢复满桶"""
+        bucket = TokenBucket(capacity=2, refill_rate=0.01)
+        bucket.allow()
+        bucket.allow()
+        assert bucket.allow() is False
+        bucket.reset()
+        assert bucket.allow() is True
+
+    def test_thread_safety(self):
+        """并发抢令牌：总放行数不超过 capacity（无超发）"""
+        import threading
+        bucket = TokenBucket(capacity=50, refill_rate=0.001)
+        allowed = []
+        lock = threading.Lock()
+
+        def worker():
+            if bucket.allow():
+                with lock:
+                    allowed.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(200)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 200 个线程抢 50 个令牌，恰好放行 50（回填速率极低可忽略）
+        assert len(allowed) == 50
