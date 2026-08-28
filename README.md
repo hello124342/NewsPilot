@@ -59,11 +59,64 @@ flowchart TB
 - Python 3.10+
 - MySQL 8.0+
 - Redis 6.0+（Docker Compose 使用 Redis 7）
-- 至少一个平台的 Bot 凭证
+- 至少一个消息平台的 Bot 凭证（Feishu、Telegram 或 Discord）
 - 一个可用的 LLM API Key，用于新闻总结和 RAG 问答
 - `OPENAI_API_KEY`，用于 ChromaDB 的文章与查询 Embedding（即使 `LLM_PROVIDER` 不是 `openai` 也需要）
 
 本地意图模型是可选依赖。启用它还需要运行 Ollama，并创建名为 `newpilot-intent` 的模型。模型训练与部署文件位于独立的 `D:\HuggingFaceModel` 目录，不随本项目提交。
+
+### Platform Setup
+
+消息平台都需要先在各自的开发者平台创建 Bot 应用，再把凭证写入 `.env`。Twitter/X 在本项目中不是消息平台，而是新闻数据源，因此不需要创建 Twitter Bot 或配置 Twitter API Key。
+
+#### Feishu
+
+1. 在 [Feishu Open Platform](https://open.feishu.cn/) 创建企业自建应用。
+2. 启用机器人能力，复制应用的 App ID 和 App Secret，分别填入 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
+3. 在权限管理中开通接收消息、发送消息，以及读取会话/成员信息所需的权限；在事件订阅中选择长连接（WebSocket）模式并订阅消息接收事件。
+4. 创建并发布应用版本，然后把 Bot 添加到目标群聊或私聊中。应用启动时通过 WebSocket 接收事件，不需要公网 Webhook URL。
+
+```env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+```
+
+#### Telegram
+
+1. 在 Telegram 中联系 [@BotFather](https://t.me/BotFather)，使用 `/newbot` 创建 Bot 并复制 Token。
+2. 将 Token 写入 `TELEGRAM_BOT_TOKEN`。Telegram 接入使用 Webhook，运行环境需要一个公网可访问的 HTTPS 地址。
+3. 启动 NewsPilot 后，使用 Telegram Bot API 注册 Webhook。默认地址是 `/webhook/telegram`；如果设置了 `TELEGRAM_WEBHOOK_SECRET`，注册时必须同时传入相同的 `secret_token`。
+
+```bash
+curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+  -d "url=https://<your-domain>/webhook/telegram" \
+  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+```
+
+本地开发可以使用 Cloudflare Tunnel、ngrok 等 HTTPS 隧道。只配置 Token 但不注册 Webhook 时，Telegram Bot 不会收到消息。
+
+#### Discord
+
+1. 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建 Application，在 **Bot** 页面添加 Bot 并复制 Token，填入 `DISCORD_BOT_TOKEN`。
+2. 在 **Bot → Privileged Gateway Intents** 开启 **Message Content Intent**，否则 Bot 无法读取被 `@mention` 的消息内容。
+3. 在 **OAuth2 → URL Generator** 中选择 `bot` 和 `applications.commands` scope，并授予至少查看频道、发送消息、嵌入链接和使用应用命令的权限。
+4. 使用生成的邀请链接把 Bot 添加到服务器。Bot 通过 Gateway 连接，不需要公网 Webhook URL；服务器中的消息需要 `@mention` Bot 才会处理。
+
+```env
+DISCORD_BOT_TOKEN=your_discord_bot_token
+# 可选：只允许接入指定服务器
+DISCORD_GUILD_ID=
+```
+
+#### Twitter/X News Sources
+
+Twitter/X 仅作为 `app/main.py` 中配置的新闻源，通过 Nitter RSS 地址抓取公开动态，不参与用户消息收发：
+
+```text
+X/Twitter -> Nitter RSS -> NewsPushGraph -> MySQL/ChromaDB -> platform delivery
+```
+
+因此 `.env` 中没有 `TWITTER_*` 配置项。Nitter 实例不可用时，对应 X/Twitter 来源会暂时无法抓取，但不影响 Feishu、Telegram 或 Discord Bot 的启动。
 
 ### Configure
 
