@@ -1,44 +1,25 @@
-"""IntentRouterNode: 查询意图分类节点
+"""Three-way intent routing for NewsPilot queries.
 
-区分用户是想"查列表"还是"问问题"，以便路由到不同的处理链路。
-- list: 按厂商/时间查找文章列表 → 现有 search_db 路径
-- qa:   自然语言问答 → 新 RAG 路径（语义检索 + LLM 综合回答）
-- command: 订阅/设置等管理命令（在 event_router 层已拦截，此处兜底）
-
-LLM 分类优先，失败时降级为关键词启发式规则。
+The order is deliberately simple and deterministic:
+1. Explicit list/QA signals are handled locally.
+2. Unmatched input goes to the optional local Ollama LoRA classifier.
+3. Disabled, unavailable, invalid, or low-confidence model output becomes unknown.
 """
-import json
+
+from __future__ import annotations
+
 import logging
 import re
+
+from app.core.config import Settings
 from app.graph.state import QueryState
-from app.core.resilience import CircuitBreakerOpenError
+from app.intent.ollama_classifier import OllamaIntentClassifier
 
 logger = logging.getLogger(__name__)
 
 
-def _emit_degraded(path: str) -> None:
-    """记录一次降级（LLM 不可用走兜底链路），延迟导入避免循环依赖"""
-    try:
-        from app.core.metrics import degraded_requests_total
-        degraded_requests_total.labels(path=path).inc()
-    except ImportError:
-        pass
-
-# 轻量分类 Prompt（复用项目的 YAML loader 模式）
-_INTENT_ROUTER_PROMPT = """你是查询意图分类器。判断用户消息属于哪种类型，返回 JSON。
-
-类型说明：
-- "list": 用户想看文章列表、查找新闻、浏览动态。关键词：有什么、最近、新闻、动态、列表、查找、搜索
-- "qa": 用户在问一个具体问题，希望得到答案而非文章列表。关键词：什么时候、为什么、是什么、怎么样、对比、区别、是否、能不能
-
-用户消息：{query}
-
-返回格式（仅返回 JSON）：
-{{"type": "list"}} 或 {{"type": "qa"}}"""
-
-# QA 类问题的启发式信号（问号 / 疑问词）
 _QA_SIGNALS = [
-    r"[?？]",           # 问号
+    r"[?？]",
     r"什么时候|何时",
     r"为什么|为何",
     r"是什么|什么是",
@@ -50,95 +31,89 @@ _QA_SIGNALS = [
     r"分析|评价|评估",
 ]
 
-# List 类问题的启发式信号
 _LIST_SIGNALS = [
     r"有什么|有哪些",
     r"最近|近日|近期",
     r"新闻|动态|消息|更新",
-    r"列表|列出|列举",
-    r"订阅|退订|设置",
+    r"列表|列出|列举|查找|搜索|查询|浏览|看看",
+]
+
+_NEWS_CONTEXT_SIGNALS = [
+    r"OpenAI|Anthropic|DeepSeek|Kimi|Moonshot|Google DeepMind|Z\.ai",
+    r"GPT|Claude|LLM|RAG|Agent",
+    r"AI|人工智能|大模型|模型|生成式",
+    r"新闻|动态|消息|报道|资讯|发布|API",
 ]
 
 
-def _classify_by_keywords(query: str) -> str:
-    """关键词启发式分类（LLM 失败时的降级方案）
-
-    优先级：QA 信号 > List 信号 > 默认 list
-    """
-    qa_score = sum(1 for pat in _QA_SIGNALS if re.search(pat, query))
-    list_score = sum(1 for pat in _LIST_SIGNALS if re.search(pat, query))
-
-    # QA 信号优先：只要检测到疑问意图，就走 qa 路径
+def _explicit_keyword_intent(query: str) -> str | None:
+    """Return an intent only when a clear local signal is present."""
+    if not any(re.search(pattern, query, re.IGNORECASE) for pattern in _NEWS_CONTEXT_SIGNALS):
+        return None
+    qa_score = sum(1 for pattern in _QA_SIGNALS if re.search(pattern, query))
+    list_score = sum(1 for pattern in _LIST_SIGNALS if re.search(pattern, query))
     if qa_score > 0:
         return "qa"
-    # 含新闻/动态关键词 → list
     if list_score > 0:
         return "list"
-    # 默认走 list（返回文章列表比什么都不返友好）
-    return "list"
+    return None
+
+
+def _classify_by_keywords(query: str) -> str:
+    """Backward-compatible keyword helper; ambiguous input defaults to list."""
+    return _explicit_keyword_intent(query) or "list"
+
+
+def _set_intent(state: QueryState, intent: str, confidence: float, source: str) -> QueryState:
+    state["query_type"] = intent
+    state["intent_confidence"] = confidence
+    state["intent_source"] = source
+    return state
 
 
 def intent_router_node(state: QueryState) -> QueryState:
-    """分类用户意图并写入 state（带 LLM 结果缓存）
-
-    优先走 LLM 分类（3 次重试通过 _call_llm_router），
-    失败时降级为关键词启发式。
-    """
+    """Classify a query using rules first, then the local Ollama model."""
     query = state.get("user_query", "").strip()
     if not query:
-        state["query_type"] = "list"
-        return state
+        return _set_intent(state, "unknown", 0.0, "unknown")
 
-    # 缓存键：operation + sha256(query)
-    import hashlib
-    cache_key = f"router:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+    keyword_intent = _explicit_keyword_intent(query)
+    if keyword_intent:
+        logger.info("Intent routed: '%s' -> %s (rule)", query[:50], keyword_intent)
+        return _set_intent(state, keyword_intent, 1.0, "rule")
 
-    # 尝试 LLM 分类（带缓存 + 熔断保护）
-    try:
-        from app.llm.provider import get_llm, llm_circuit_breaker
-        from app.core.config import Settings
-        from app.core.multi_cache import get_llm_cache
-        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    settings = Settings()  # type: ignore[call-arg]
+    if not settings.INTENT_OLLAMA_ENABLED:
+        logger.info("Intent routed: '%s' -> unknown (ollama disabled)", query[:50])
+        return _set_intent(state, "unknown", 0.0, "unknown")
 
-        @retry(
-            stop=stop_after_attempt(2),
-            wait=wait_exponential(multiplier=1, min=1, max=3),
-            retry=retry_if_exception_type(Exception),
-            reraise=True,
+    classifier = OllamaIntentClassifier(
+        base_url=settings.INTENT_OLLAMA_URL,
+        model=settings.INTENT_OLLAMA_MODEL,
+        timeout=settings.INTENT_OLLAMA_TIMEOUT_SECONDS,
+        threshold=settings.INTENT_CONFIDENCE_THRESHOLD,
+    )
+    prediction = classifier.predict(query)
+    if prediction.intent in ("list", "qa") and prediction.confidence is not None:
+        logger.info(
+            "Intent routed: '%s' -> %s (ollama, confidence=%.2f)",
+            query[:50],
+            prediction.intent,
+            prediction.confidence,
         )
-        def _call_llm_router(llm, prompt: str) -> str:
-            response = llm.invoke(prompt)
-            return response.content  # type: ignore[union-attr]
-
-        settings = Settings()  # type: ignore[call-arg]
-        llm = get_llm(settings)
-        prompt = _INTENT_ROUTER_PROMPT.format(query=query)
-
-        # 熔断器包裹：LLM 连续故障时 OPEN 快速失败，直接落降级链路
-        cache = get_llm_cache()
-        content = cache.get_or_load(
-            cache_key,
-            lambda: llm_circuit_breaker.call(_call_llm_router, llm, prompt),
+        return _set_intent(
+            state, prediction.intent, prediction.confidence, prediction.source
         )
 
-        json_match = re.search(r"\{[^}]+\}", content)
-        if json_match:
-            result = json.loads(json_match.group())
-            query_type = result.get("type", "list")
-            if query_type in ("list", "qa"):
-                state["query_type"] = query_type
-                logger.info(f"Intent routed: '{query[:50]}' → {query_type} (LLM)")
-                return state
-
-    except CircuitBreakerOpenError:
-        _emit_degraded("router")
-        logger.warning("LLM circuit OPEN, intent routing degraded to keyword heuristic")
-    except Exception as e:
-        _emit_degraded("router")
-        logger.warning(f"LLM intent routing failed, falling back to keywords: {e}")
-
-    # 降级：关键词启发式
-    query_type = _classify_by_keywords(query)
-    state["query_type"] = query_type
-    logger.info(f"Intent routed: '{query[:50]}' → {query_type} (heuristic)")
-    return state
+    logger.info(
+        "Intent routed: '%s' -> unknown (%s, confidence=%s)",
+        query[:50],
+        prediction.source,
+        prediction.confidence,
+    )
+    return _set_intent(
+        state,
+        "unknown",
+        prediction.confidence or 0.0,
+        prediction.source,
+    )
