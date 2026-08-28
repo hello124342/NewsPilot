@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: float = 60.0
     LLM_MAX_RETRIES: int = 2  # SDK 层重试次数（节点层另有自己的重试逻辑）
 
+    # ========== 本地意图分类配置 ==========
+    # 规则命中后不会调用模型；未命中时按此开关调用本地 Ollama。
+    INTENT_OLLAMA_ENABLED: bool = False
+    INTENT_OLLAMA_URL: str = "http://127.0.0.1:11434"
+    INTENT_OLLAMA_MODEL: str = "newpilot-intent"
+    INTENT_CONFIDENCE_THRESHOLD: float = 0.75
+    INTENT_OLLAMA_TIMEOUT_SECONDS: float = 5.0
+
     # ========== 管理接口配置 ==========
     # /admin/* 端点的访问令牌。留空则管理端点整体禁用（fail-closed），
     # 因为这些端点可触发群发消息和批量 embedding 计费

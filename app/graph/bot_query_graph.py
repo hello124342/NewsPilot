@@ -1,7 +1,7 @@
 """BotQueryGraph: 飞书交互查询工作流定义
 
 编排 @Bot 消息触发后的意图分类→处理→回复链路。
-支持条件路由：list（文章列表）和 qa（RAG 智能问答）两条路径。
+支持条件路由：list（文章列表）、qa（RAG 智能问答）和 unknown（使用引导）三条路径。
 """
 from langgraph.graph import StateGraph, END
 from app.graph.state import QueryState
@@ -12,6 +12,7 @@ from app.graph.nodes.format_response import format_response_node
 from app.graph.nodes.rag_retrieve import rag_retrieve_node
 from app.graph.nodes.rag_answer import rag_answer_node
 from app.graph.nodes.reply_feishu import reply_feishu_node
+from app.graph.nodes.unknown_response import unknown_response_node
 
 import logging
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ def _route_by_query_type(state: QueryState) -> str:
     query_type = state.get("query_type", "list")
     if query_type == "qa":
         return "qa"
+    if query_type == "unknown":
+        return "unknown"
     return "list"
 
 
@@ -123,7 +126,8 @@ def build_query_graph() -> StateGraph:
 
       intent_router:
         ├─ "list" → intent (vendor+days) → search_db → format_response → reply → END
-        └─ "qa"   → rag_retrieve → rag_answer → format_rag_response → reply → END
+        ├─ "qa"      → rag_retrieve → rag_answer → format_rag_response → reply → END
+        └─ "unknown" → unknown_response → reply → END
 
     向后兼容：list 路径保留了完整的 4 节点链路（intent → search_db → format_response → reply）。
     qa 路径是新增的 RAG 智能问答链路。
@@ -141,6 +145,7 @@ def build_query_graph() -> StateGraph:
     graph.add_node("rag_retrieve", rag_retrieve_node)
     graph.add_node("rag_answer", rag_answer_node)
     graph.add_node("format_rag_response", _format_rag_response_node)
+    graph.add_node("unknown_response", unknown_response_node)
     graph.add_node("reply", reply_feishu_node)
 
     # 入口 → 意图路由
@@ -153,6 +158,7 @@ def build_query_graph() -> StateGraph:
         {
             "list": "intent",
             "qa": "rag_retrieve",
+            "unknown": "unknown_response",
         },
     )
 
@@ -166,5 +172,8 @@ def build_query_graph() -> StateGraph:
     graph.add_edge("rag_retrieve", "rag_answer")
     graph.add_edge("rag_answer", "format_rag_response")
     graph.add_edge("format_rag_response", "reply")
+
+    # --- unknown 路径：只返回使用引导，不查询数据库或 RAG ---
+    graph.add_edge("unknown_response", "reply")
 
     return graph.compile()

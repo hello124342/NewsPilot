@@ -31,7 +31,9 @@ class QueryState(TypedDict, total=False):
     user_id: str           # 触发用户 ID
     chat_id: str           # 群聊 / 单聊 ID
     user_query: str        # 用户输入的原始文本
-    query_type: str        # 意图分类: "list" | "qa"
+    query_type: str        # 意图分类: "list" | "qa" | "unknown"
+    intent_confidence: float  # 本地模型返回的置信度（规则命中时为 1.0）
+    intent_source: str      # rule | ollama | unknown
     parsed_intent: dict    # LLM 解析出的查询条件 {"vendor": str, "days": int}
     query_results: list[dict]  # 数据库查询结果（list 路径使用）
     rag_context: list[dict]    # RAG 检索到的文章上下文（qa 路径使用）

@@ -96,3 +96,8 @@ class TestBotQueryGraph:
         graph = build_query_graph()
         assert graph is not None
         assert hasattr(graph, "invoke")
+
+    def test_unknown_route_is_supported(self):
+        from app.graph.bot_query_graph import _route_by_query_type
+
+        assert _route_by_query_type({"query_type": "unknown"}) == "unknown"
